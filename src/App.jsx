@@ -975,7 +975,7 @@ const ShuntWSSAnalyzer = () => {
                  </div>
              </div>
              
-             <div className="flex-1 min-h-0 relative">
+             <div className="flex-1 min-h-0 min-w-0 relative">
                <ResponsiveContainer width="100%" height="100%">
                   {graphMode === 'wss_pressure' ? (
                       <ComposedChart data={timeSeriesData}>
