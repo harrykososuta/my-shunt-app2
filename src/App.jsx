@@ -395,180 +395,208 @@ const ShuntWSSAnalyzer = () => {
       drawStack(prev, stackCanvasLargeRef.current, true);
   };
 
-  // --- 解析ロジック (省略なし) ---
+ // --- 解析ロジック (省略なし) ---
   const processFrame = useCallback(() => {
-    if (!videoRef.current || !canvasRef.current || videoRef.current.paused || videoRef.current.ended) return;
-    const video = videoRef.current;
-    const canvas = canvasRef.current;
-    const ctx = canvas.getContext('2d', { willReadFrequently: true });
-    
-    if (canvas.width !== video.videoWidth) { canvas.width = video.videoWidth; canvas.height = video.videoHeight; }
-    const w = canvas.width;
-    const h = canvas.height;
-    
-    ctx.drawImage(video, 0, 0, w, h);
-
-    if(config.roiFlow) {
-        ctx.strokeStyle = 'rgba(239, 68, 68, 0.5)'; ctx.lineWidth = 1;
+    try {
+      const video = videoRef.current;
+      const canvas = canvasRef.current;
+  
+      if (!video || !canvas) return;
+      if (video.paused || video.ended) return;
+  
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      if (!ctx) return;
+  
+      if (canvas.width !== video.videoWidth) {
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+      }
+      const w = canvas.width;
+      const h = canvas.height;
+  
+      ctx.drawImage(video, 0, 0, w, h);
+  
+      if (config.roiFlow) {
+        ctx.strokeStyle = 'rgba(239, 68, 68, 0.5)';
+        ctx.lineWidth = 1;
         ctx.strokeRect(config.roiFlow.x * w, config.roiFlow.y * h, config.roiFlow.w * w, config.roiFlow.h * h);
-    }
-    if(config.roiVessel) {
-        ctx.strokeStyle = 'rgba(16, 185, 129, 0.5)'; ctx.lineWidth = 1;
+      }
+      if (config.roiVessel) {
+        ctx.strokeStyle = 'rgba(16, 185, 129, 0.5)';
+        ctx.lineWidth = 1;
         ctx.strokeRect(config.roiVessel.x * w, config.roiVessel.y * h, config.roiVessel.w * w, config.roiVessel.h * h);
-    }
-
-    const frameData = ctx.getImageData(0, 0, w, h);
-    const data = frameData.data;
-    
-    let vesselPoints = [];
-    let frameTotalStress = 0, frameMaxStress = 0, frameStressPixels = 0;
-    const getIndex = (x, y) => (y * w + x) * 4;
-
-    const getFlowVector = (r, g, b) => {
+      }
+  
+      const frameData = ctx.getImageData(0, 0, w, h);
+      const data = frameData.data;
+  
+      let vesselPoints = [];
+      let frameTotalStress = 0, frameMaxStress = 0, frameStressPixels = 0;
+  
+      const getIndex = (x, y) => (y * w + x) * 4;
+  
+      const getFlowVector = (r, g, b) => {
         const isRed = r > g + config.colorThreshold && r > b + config.colorThreshold;
         const isBlue = b > g + config.colorThreshold && b > r + config.colorThreshold;
         return isRed ? { dir: 1, val: r } : isBlue ? { dir: -1, val: b } : { dir: 0, val: 0 };
-    };
-
-    let roiVx = 0, roiVy = 0;
-    if (config.roiVessel) {
+      };
+  
+      let roiVx = 0, roiVy = 0;
+      if (config.roiVessel) {
         const sx = Math.floor(config.roiVessel.x * w), sy = Math.floor(config.roiVessel.y * h);
         const ex = Math.floor((config.roiVessel.x + config.roiVessel.w) * w), ey = Math.floor((config.roiVessel.y + config.roiVessel.h) * h);
-        roiVx = (sx+ex)/2; roiVy = (sy+ey)/2;
-
+        roiVx = (sx + ex) / 2; roiVy = (sy + ey) / 2;
+  
         for (let y = sy; y < ey; y += 2) {
-            for (let x = sx; x < ex; x += 2) {
-                const i = getIndex(x, y);
-                const brightness = (data[i] + data[i+1] + data[i+2]) / 3;
-                
-                if (brightness > config.wallThreshold) {
-                    let isInnerWall = false;
-                    const checkRange = 3; 
-                    for (let oy = -checkRange; oy <= checkRange; oy+=2) {
-                        for (let ox = -checkRange; ox <= checkRange; ox+=2) {
-                             if (ox===0 && oy===0) continue;
-                             const ni = getIndex(x+ox, y+oy);
-                             if(ni>=0 && ni<data.length) {
-                                 const nb = (data[ni] + data[ni+1] + data[ni+2]) / 3;
-                                 if(nb < config.wallThreshold * 0.8) { 
-                                     isInnerWall = true; 
-                                     break; 
-                                 }
-                             }
-                        }
-                        if(isInnerWall) break;
-                    }
-                    if(isInnerWall) {
-                        vesselPoints.push({x: x - roiVx, y: y - roiVy}); 
-                    }
+          for (let x = sx; x < ex; x += 2) {
+            const i = getIndex(x, y);
+            const brightness = (data[i] + data[i + 1] + data[i + 2]) / 3;
+  
+            if (brightness > config.wallThreshold) {
+              let isInnerWall = false;
+              const checkRange = 3;
+              for (let oy = -checkRange; oy <= checkRange; oy += 2) {
+                for (let ox = -checkRange; ox <= checkRange; ox += 2) {
+                  if (ox === 0 && oy === 0) continue;
+                  const nx = x + ox, ny = y + oy;
+                  if (nx < 0 || nx >= w || ny < 0 || ny >= h) continue;
+  
+                  const ni = getIndex(nx, ny);
+                  const nb = (data[ni] + data[ni + 1] + data[ni + 2]) / 3;
+                  if (nb < config.wallThreshold * 0.8) { isInnerWall = true; break; }
                 }
+                if (isInnerWall) break;
+              }
+              if (isInnerWall) vesselPoints.push({ x: x - roiVx, y: y - roiVy });
             }
-        }
-    }
-
-    let startX = 0, startY = 0, endX = w, endY = h;
-    if (config.roiFlow) {
-        startX = Math.floor(config.roiFlow.x * w); startY = Math.floor(config.roiFlow.y * h);
-        endX = Math.floor((config.roiFlow.x + config.roiFlow.w) * w); endY = Math.floor((config.roiFlow.y + config.roiFlow.h) * h);
-    }
-    startX = Math.max(0, startX); startY = Math.max(0, startY); endX = Math.min(w, endX); endY = Math.min(h, endY);
-
-    let flowSumX = 0, flowSumY = 0, flowCount = 0;
-    const overlayData = ctx.createImageData(w, h);
-    const output = overlayData.data;
-
-    for (let y = startY + 1; y < endY - 1; y++) {
-      for (let x = startX + 1; x < endX - 1; x++) {
-        const i = getIndex(x, y);
-        const flow = getFlowVector(data[i], data[i+1], data[i+2]);
-        
-        if (flow.dir !== 0) {
-            flowSumX += x; flowSumY += y; flowCount++;
-        } else {
-           let maxVel = 0, maxDir = 0;
-           const neighbors = [getIndex(x+1, y), getIndex(x-1, y), getIndex(x, y+1), getIndex(x, y-1)];
-           for (let ni of neighbors) {
-               const nf = getFlowVector(data[ni], data[ni+1], data[ni+2]);
-               if (nf.val > maxVel) { maxVel = nf.val; maxDir = nf.dir; }
-           }
-
-           if (maxVel > 0) {
-               let stress = Math.min(255, maxVel * (maxVel/255 * config.stressMultiplier));
-               frameTotalStress += stress;
-               if (stress > frameMaxStress) frameMaxStress = stress;
-               frameStressPixels++;
-
-               const cx = accumulationRef.current.centroid.x || w/2;
-               const cy = accumulationRef.current.centroid.y || h/2;
-               let angle = Math.atan2(y - cy, x - cx) * (180 / Math.PI);
-               if (angle < 0) angle += 360;
-               
-               const sIdx = Math.floor(angle / (360 / config.sectorCount)) % config.sectorCount;
-               const sec = accumulationRef.current.sectors[sIdx];
-               sec.sumAbsWss += stress;
-               sec.sumSignedWss += stress * maxDir; 
-               sec.count++;
-               if (stress > sec.maxWss) { sec.maxWss = stress; sec.maxFrame = accumulationRef.current.frameCount; }
-               if (maxDir < 0 && stress > sec.minWss) { sec.minWss = stress; sec.minFrame = accumulationRef.current.frameCount; }
-
-               const oIdx = getIndex(x, y);
-               if (stress < 100) {
-                  output[oIdx] = stress*2.5; output[oIdx+1] = 255; output[oIdx+2] = 0;
-               } else {
-                  output[oIdx] = 255; output[oIdx+1] = 255 - (stress-100)*1.6; output[oIdx+2] = 0;
-               }
-               output[oIdx+3] = 255;
-           }
+          }
         }
       }
-    }
-
-    if (flowCount > 0) {
-        accumulationRef.current.centroid = { x: flowSumX / flowCount, y: flowSumY / flowCount };
-    }
-
-    const tempCanvas = document.createElement('canvas'); tempCanvas.width = w; tempCanvas.height = h;
-    tempCanvas.getContext('2d').putImageData(overlayData, 0, 0);
-    ctx.globalAlpha = 1.0; ctx.drawImage(tempCanvas, 0, 0);
-
-    const acc = accumulationRef.current;
-    acc.frameCount++;
-    setCurrentFrameCount(acc.frameCount);
-
-    if (acc.frameCount % 2 === 0) {
-        acc.stackBuffer.push({
-            frame: acc.frameCount,
-            vesselPoints: vesselPoints, 
-        });
+  
+      let startX = 0, startY = 0, endX = w, endY = h;
+      if (config.roiFlow) {
+        startX = Math.floor(config.roiFlow.x * w); startY = Math.floor(config.roiFlow.y * h);
+        endX = Math.floor((config.roiFlow.x + config.roiFlow.w) * w);
+        endY = Math.floor((config.roiFlow.y + config.roiFlow.h) * h);
+      }
+      startX = Math.max(0, startX); startY = Math.max(0, startY);
+      endX = Math.min(w, endX); endY = Math.min(h, endY);
+  
+      let flowSumX = 0, flowSumY = 0, flowCount = 0;
+      const overlayData = ctx.createImageData(w, h);
+      const output = overlayData.data;
+  
+      for (let y = startY + 1; y < endY - 1; y++) {
+        for (let x = startX + 1; x < endX - 1; x++) {
+          const i = getIndex(x, y);
+          const flow = getFlowVector(data[i], data[i + 1], data[i + 2]);
+  
+          if (flow.dir !== 0) {
+            flowSumX += x; flowSumY += y; flowCount++;
+          } else {
+            let maxVel = 0, maxDir = 0;
+            const neighbors = [getIndex(x + 1, y), getIndex(x - 1, y), getIndex(x, y + 1), getIndex(x, y - 1)];
+            for (let ni of neighbors) {
+              const nf = getFlowVector(data[ni], data[ni + 1], data[ni + 2]);
+              if (nf.val > maxVel) { maxVel = nf.val; maxDir = nf.dir; }
+            }
+  
+            if (maxVel > 0) {
+              let stress = Math.min(255, maxVel * (maxVel / 255 * config.stressMultiplier));
+              frameTotalStress += stress;
+              if (stress > frameMaxStress) frameMaxStress = stress;
+              frameStressPixels++;
+  
+              const cx = accumulationRef.current.centroid.x || w / 2;
+              const cy = accumulationRef.current.centroid.y || h / 2;
+              let angle = Math.atan2(y - cy, x - cx) * (180 / Math.PI);
+              if (angle < 0) angle += 360;
+  
+              const sIdx = Math.floor(angle / (360 / config.sectorCount)) % config.sectorCount;
+              const sec = accumulationRef.current.sectors[sIdx];
+              if (!sec) continue; // ★ここで落とさない
+  
+              sec.sumAbsWss += stress;
+              sec.sumSignedWss += stress * maxDir;
+              sec.count++;
+              if (stress > sec.maxWss) { sec.maxWss = stress; sec.maxFrame = accumulationRef.current.frameCount; }
+              // minWss の初期値が 0 だと更新されにくいので、必要なら minWss を Infinity 初期化してください
+              if (maxDir < 0 && stress > sec.minWss) { sec.minWss = stress; sec.minFrame = accumulationRef.current.frameCount; }
+  
+              const oIdx = getIndex(x, y);
+              if (stress < 100) {
+                output[oIdx] = stress * 2.5; output[oIdx + 1] = 255; output[oIdx + 2] = 0;
+              } else {
+                output[oIdx] = 255; output[oIdx + 1] = 255 - (stress - 100) * 1.6; output[oIdx + 2] = 0;
+              }
+              output[oIdx + 3] = 255;
+            }
+          }
+        }
+      }
+  
+      if (flowCount > 0) accumulationRef.current.centroid = { x: flowSumX / flowCount, y: flowSumY / flowCount };
+  
+      const tempCanvas = document.createElement('canvas');
+      tempCanvas.width = w; tempCanvas.height = h;
+      tempCanvas.getContext('2d').putImageData(overlayData, 0, 0);
+      ctx.globalAlpha = 1.0;
+      ctx.drawImage(tempCanvas, 0, 0);
+  
+      const acc = accumulationRef.current;
+      acc.frameCount++;
+  
+      // ★UI更新は重いので間引く（6フレームに1回）
+      if (acc.frameCount % 6 === 0) {
+        setCurrentFrameCount(acc.frameCount);
+      }
+  
+      // stackも無限に増やさない（最大120フレーム）
+      if (acc.frameCount % 2 === 0) {
+        acc.stackBuffer.push({ frame: acc.frameCount, vesselPoints });
+        if (acc.stackBuffer.length > 120) acc.stackBuffer.splice(0, acc.stackBuffer.length - 120);
+  
         drawStack(acc.stackBuffer, stackCanvasRef.current, false);
-        if(is3DModalOpen) drawStack(acc.stackBuffer, stackCanvasLargeRef.current, true);
-    }
-    
-    let areaVal = flowCount;
-    let unit = 'px²';
-    if(config.scalePxPerCm > 0) {
-        areaVal = flowCount / (config.scalePxPerCm**2);
+        if (is3DModalOpen) drawStack(acc.stackBuffer, stackCanvasLargeRef.current, true);
+      }
+  
+      let areaVal = flowCount;
+      let unit = 'px²';
+      if (config.scalePxPerCm > 0) {
+        areaVal = flowCount / (config.scalePxPerCm ** 2);
         unit = 'cm²';
+      }
+  
+      const avg = frameStressPixels > 0 ? frameTotalStress / frameStressPixels : 0;
+  
+      // ★時系列も間引き＆上限200点
+      if (acc.frameCount % 6 === 0) {
+        setTimeSeriesData(prev => {
+          const next = [...prev, {
+            frame: acc.frameCount,
+            avgWss: Number(avg.toFixed(1)),
+            area: Number(areaVal.toFixed(3)),
+          }];
+          return next.length > 200 ? next.slice(-200) : next;
+        });
+  
+        setRealtimeMetrics({
+          avg: Math.round(avg),
+          max: Math.round(frameMaxStress),
+          area: `${areaVal.toFixed(2)} ${unit}`,
+          evaluation: avg > 80 ? 'HIGH' : avg > 40 ? 'WARN' : 'NORM'
+        });
+      }
+  
+      animationRef.current = requestAnimationFrame(processFrame);
+  
+    } catch (e) {
+      console.error("processFrame crashed:", e);
+      cancelAnimationFrame(animationRef.current);
+      setIsPlaying(false);
+      setAnalysisStatus?.("エラー");
     }
-    
-    if(acc.frameCount % 2 === 0) {
-        const avgS = frameStressPixels > 0 ? frameTotalStress / frameStressPixels : 0;
-        setTimeSeriesData(prev => [...prev, { 
-            frame: acc.frameCount, 
-            avgWss: parseFloat(avgS.toFixed(1)),
-            area: parseFloat(areaVal.toFixed(3)),
-        }]);
-    }
-
-    const avg = frameStressPixels > 0 ? frameTotalStress / frameStressPixels : 0;
-    setRealtimeMetrics({
-        avg: Math.round(avg), max: Math.round(frameMaxStress),
-        area: `${areaVal.toFixed(2)} ${unit}`,
-        evaluation: avg > 80 ? 'HIGH' : avg > 40 ? 'WARN' : 'NORM'
-    });
-
-    animationRef.current = requestAnimationFrame(processFrame);
-  }, [config, is3DModalOpen]); 
+  }, [config, is3DModalOpen]);
 
   // --- 3D描画 ---
   const drawStack = useCallback((buffer, canvas, isLarge) => {
