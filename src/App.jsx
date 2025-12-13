@@ -61,12 +61,29 @@ const ShuntWSSAnalyzer = () => {
   const animationRef = useRef(null);
   const containerRef = useRef(null);
   
+  // ✅ ここに追加（Chart用）
+  const chartWrapRef = useRef(null);
+  const [chartReady, setChartReady] = useState(false);
+  
+  useLayoutEffect(() => {
+    const el = chartWrapRef.current;
+    if (!el) return;
+  
+    const ro = new ResizeObserver(([entry]) => {
+      const { width, height } = entry.contentRect;
+      setChartReady(width > 10 && height > 10);
+    });
+  
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  
   const accumulationRef = useRef({
     sectors: Array(36).fill(0),
     frameCount: 0,
     startTime: 0,
     centroid: { x: 0, y: 0 },
-    stackBuffer: [] 
+    stackBuffer: []
   });
 
   // --- 初期化 ---
@@ -1004,7 +1021,7 @@ const ShuntWSSAnalyzer = () => {
              </div>
              
              <div className="flex-1 min-h-0 min-w-0 relative">
-               <div className="w-full min-w-0" style={{ height: 280 }}>
+               <div ref={chartWrapRef} className="w-full min-w-0" style={{ height: 280 }}>
                  <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={260} debounce={50}>
                     {graphMode === 'wss_pressure' ? (
                         <ComposedChart data={timeSeriesData}>
