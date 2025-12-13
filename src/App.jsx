@@ -1046,7 +1046,7 @@ const ShuntWSSAnalyzer = () => {
               >
                 {graphW > 0 ? (
                   graphMode === 'wss_pressure' ? (
-                    <ComposedChart width={graphW} height={280} data={timeSeriesData}>
+                    <ComposedChart key={graphMode} width={graphW} height={280} data={timeSeriesData}>
                       <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
                       <XAxis dataKey="frame" stroke="#64748b" tick={{ fontSize: 10 }} label={{ value: 'Frame', position: 'insideBottom', offset: -5, fontSize: 10 }} />
                       <YAxis yAxisId="left" stroke="#3b82f6" label={{ value: 'Avg WSS', angle: -90, position: 'insideLeft', fontSize: 10, fill: '#3b82f6' }} tick={{ fontSize: 10 }} />
@@ -1057,7 +1057,7 @@ const ShuntWSSAnalyzer = () => {
                       <Area yAxisId="right" type="monotone" dataKey="area" stroke="#10b981" fill="rgba(16,185,129,0.2)" name="Vessel Area (Pressure Proxy)" />
                     </ComposedChart>
                   ) : graphMode === 'rrt' ? (
-                    <ComposedChart width={graphW} height={280} data={sectorResults}>
+                    <ComposedChart key={graphMode} width={graphW} height={280} data={sectorResults}>
                       <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
                       <XAxis dataKey="angle" stroke="#64748b" tick={{ fontSize: 10 }} label={{ value: 'Angle', position: 'insideBottom', offset: -5, fontSize: 10 }} />
                       <YAxis stroke="#ef4444" label={{ value: 'RRT', angle: -90, position: 'insideLeft', fontSize: 10, fill: '#ef4444' }} tick={{ fontSize: 10 }} />
@@ -1066,7 +1066,7 @@ const ShuntWSSAnalyzer = () => {
                       <Area type="monotone" dataKey="rrt" stroke="#ef4444" fill="rgba(239,68,68,0.2)" name="Relative Residence Time" />
                     </ComposedChart>
                   ) : (
-                    <ComposedChart width={graphW} height={280} data={sectorResults}>
+                    <ComposedChart key={graphMode} width={graphW} height={280} data={sectorResults}>
                       <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
                       <XAxis dataKey="angle" stroke="#64748b" tick={{ fontSize: 10 }} label={{ value: 'Angle', position: 'insideBottom', offset: -5, fontSize: 10 }} />
                       <YAxis yAxisId="left" stroke="#3b82f6" label={{ value: 'TAWSS', angle: -90, position: 'insideLeft', fontSize: 10, fill: '#3b82f6' }} tick={{ fontSize: 10 }} />
