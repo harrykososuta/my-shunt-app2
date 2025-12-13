@@ -1,5 +1,5 @@
   // ShuntFlow Analytics - v1.0.0 Release Candidate
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useCallback,useLayoutEffect } from 'react';
 import { Upload, Play, Pause, RotateCcw, Activity, AlertCircle, FileVideo, Crosshair, Gauge, Download, Settings, Ruler, Scan, Layers, Eye, Zap, Move3d, MousePointer2, TrendingUp, Maximize2, X, Sliders, Eraser, Undo, Scissors, ZoomIn, ZoomOut, RefreshCw, Move, Camera } from 'lucide-react';
 import { ComposedChart, Line, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from 'recharts';
 
