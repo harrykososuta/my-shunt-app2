@@ -1,4 +1,4 @@
-// ShuntFlow Analytics - v1.0.4 (Strict DOM separation and ResizeObserver guard)
+// ShuntFlow Analytics - v1.0.5 (Fix crash by preventing unmount & state updates during play)
 import React, { useState, useRef, useEffect, useLayoutEffect, useCallback } from 'react';
 import {
   Upload, Play, Pause, RotateCcw, Activity, AlertCircle, FileVideo, Crosshair,
@@ -44,7 +44,7 @@ const ShuntWSSAnalyzer = () => {
   const [selectionBox, setSelectionBox] = useState(null);
   const [historyStack, setHistoryStack] = useState([]);
 
-  // --- 解析結果（表示用：ここは解析中に更新しない） ---
+  // --- 解析結果 ---
   const [sectorResults, setSectorResults] = useState([]);
   const [timeSeriesData, setTimeSeriesData] = useState([]);
   const [analysisStatus, setAnalysisStatus] = useState('待機中');
@@ -65,32 +65,30 @@ const ShuntWSSAnalyzer = () => {
   const animationRef = useRef(null);
   const containerRef = useRef(null);
 
-  // ✅ 解析中の大量更新を避けるため、解析中に更新するものは refs に貯める
+  // refs for heavy updates
   const frameCountRef = useRef(0);
   const metricsRef = useRef({ avg: 0, max: 0, area: 0, evaluation: '-' });
-  const timeSeriesRef = useRef([]); // [{frame, avgWss, area}]
+  const timeSeriesRef = useRef([]);
   const uiTimerRef = useRef(null);
 
-  // ✅ グラフ幅（Rechartsは解析中に描画しない）
+  // ✅ グラフ幅: ResizeObserver は常時監視するが、isPlaying中はstate更新をスキップするガードを入れる
   const graphBoxRef = useRef(null);
   const [graphW, setGraphW] = useState(0);
 
-  // ✅ FIX 1: 解析中(isPlaying)は ResizeObserver の処理をスキップして State 更新を防ぐ
   useLayoutEffect(() => {
     const el = graphBoxRef.current;
     if (!el) return;
 
     const ro = new ResizeObserver(([entry]) => {
-      // 解析中はサイズ変更があっても無視（再レンダリング連鎖を防ぐ）
+      // 解析中はリサイズイベントを無視して再レンダリングを防ぐ
       if (isPlaying) return;
-
       const w = Math.floor(entry.contentRect.width);
       setGraphW(w > 10 ? w : 0);
     });
 
     ro.observe(el);
     return () => ro.disconnect();
-  }, [isPlaying]); // isPlayingが変わるたびにObserverを再設定
+  }, [isPlaying]);
 
   const makeSectorAccumulator = (n) =>
     Array(n).fill(0).map(() => ({
@@ -109,7 +107,8 @@ const ShuntWSSAnalyzer = () => {
     stackBuffer: []
   });
 
-  // ✅ UI更新タイマー（解析中だけ 250ms ごとに state に反映）
+  // ✅ FIX 1: 解析中は「重いグラフデータ(timeSeriesData)」をStateに入れない
+  // これにより、見えていないグラフが裏で再レンダリングされるのを防ぐ
   useEffect(() => {
     if (!isPlaying) {
       if (uiTimerRef.current) {
@@ -122,8 +121,8 @@ const ShuntWSSAnalyzer = () => {
     uiTimerRef.current = setInterval(() => {
       setCurrentFrameCount(frameCountRef.current);
       setRealtimeMetrics({ ...metricsRef.current });
-      // ここだけ配列コピー（200点に制限済み）
-      setTimeSeriesData([...timeSeriesRef.current]);
+      // ❌ 削除: setTimeSeriesData([...timeSeriesRef.current]);
+      // 解析中はグラフ更新をしない。完了時に一括更新する。
     }, 250);
 
     return () => {
@@ -176,7 +175,6 @@ const ShuntWSSAnalyzer = () => {
       stackBuffer: []
     };
 
-    // Canvasクリア
     [bullseyeRef, stackCanvasRef, stackCanvasLargeRef].forEach(ref => {
       if (ref.current) {
         const ctx = ref.current.getContext('2d');
@@ -203,7 +201,6 @@ const ShuntWSSAnalyzer = () => {
     }
   };
 
-  // --- 3D保存 (スクリーンショット) ---
   const handleSave3DImage = () => {
     const canvas = stackCanvasLargeRef.current;
     if (!canvas) return;
@@ -214,7 +211,6 @@ const ShuntWSSAnalyzer = () => {
     link.click();
   };
 
-  // --- 描画 (Overlay & Preview) ---
   const renderOverlay = useCallback(() => {
     const video = videoRef.current;
     const canvas = canvasRef.current;
@@ -231,7 +227,6 @@ const ShuntWSSAnalyzer = () => {
     const w = canvas.width;
     const h = canvas.height;
 
-    // 停止中は映像フレームを描画
     if (!isPlaying) {
       ctx.drawImage(video, 0, 0, w, h);
     }
@@ -289,7 +284,6 @@ const ShuntWSSAnalyzer = () => {
 
   useEffect(() => { requestAnimationFrame(renderOverlay); }, [renderOverlay]);
 
-  // --- マウス操作 (ROI/Calib) ---
   const handleMouseDown = (e) => {
     if (toolMode === 'none' || !containerRef.current) return;
     const rect = containerRef.current.getBoundingClientRect();
@@ -341,7 +335,6 @@ const ShuntWSSAnalyzer = () => {
     }
   };
 
-  // --- 3D 操作 ---
   useEffect(() => {
     if (is3DModalOpen && modalContainerRef.current) {
       const updateSize = () => {
@@ -410,7 +403,6 @@ const ShuntWSSAnalyzer = () => {
     setZoomLevel(prev => e.deltaY < 0 ? Math.min(prev * scaleFactor, 5.0) : Math.max(prev / scaleFactor, 0.2));
   };
 
-  // --- 3D描画 ---
   const drawStack = useCallback((buffer, canvas, isLarge) => {
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
@@ -532,7 +524,6 @@ const ShuntWSSAnalyzer = () => {
     if (is3DModalOpen) drawStack(accumulationRef.current.stackBuffer, stackCanvasLargeRef.current, true);
   }, [drawStack, is3DModalOpen]);
 
-  // 3D点群の削除処理
   const deleteSelectedPoints = () => {
     if (!selectionBox || !stackCanvasLargeRef.current) return;
 
@@ -589,7 +580,6 @@ const ShuntWSSAnalyzer = () => {
     drawStack(prev, stackCanvasLargeRef.current, true);
   };
 
-  // --- 解析ロジック ---
   const processFrame = useCallback(() => {
     const video = videoRef.current;
     const canvas = canvasRef.current;
@@ -610,7 +600,6 @@ const ShuntWSSAnalyzer = () => {
 
     ctx.drawImage(video, 0, 0, w, h);
 
-    // ROI枠表示（描画のみ：React stateはいじらない）
     if (config.roiFlow) {
       ctx.strokeStyle = 'rgba(239, 68, 68, 0.5)';
       ctx.lineWidth = 1;
@@ -638,7 +627,6 @@ const ShuntWSSAnalyzer = () => {
       return isRed ? { dir: 1, val: r } : isBlue ? { dir: -1, val: b } : { dir: 0, val: 0 };
     };
 
-    // 血管壁点群抽出
     let roiVx = 0, roiVy = 0;
     if (config.roiVessel) {
       const sx = Math.floor(config.roiVessel.x * w), sy = Math.floor(config.roiVessel.y * h);
@@ -673,7 +661,6 @@ const ShuntWSSAnalyzer = () => {
       }
     }
 
-    // 解析ROIの範囲
     let startX = 0, startY = 0, endX = w, endY = h;
     if (config.roiFlow) {
       startX = Math.floor(config.roiFlow.x * w); startY = Math.floor(config.roiFlow.y * h);
@@ -742,7 +729,6 @@ const ShuntWSSAnalyzer = () => {
       accumulationRef.current.centroid = { x: flowSumX / flowCount, y: flowSumY / flowCount };
     }
 
-    // overlay描画
     const tempCanvas = document.createElement('canvas');
     tempCanvas.width = w; tempCanvas.height = h;
     const tctx = tempCanvas.getContext('2d');
@@ -752,10 +738,8 @@ const ShuntWSSAnalyzer = () => {
       ctx.drawImage(tempCanvas, 0, 0);
     }
 
-    // フレームカウント更新（stateは更新しない）
     frameCountRef.current += 1;
 
-    // stackBufferも無限に増やさない（最大120）
     if (frameCountRef.current % 2 === 0) {
       const sb = accumulationRef.current.stackBuffer;
       sb.push({ frame: frameCountRef.current, vesselPoints });
@@ -765,7 +749,6 @@ const ShuntWSSAnalyzer = () => {
       if (is3DModalOpen) drawStack(sb, stackCanvasLargeRef.current, true);
     }
 
-    // 面積 proxy
     let areaVal = flowCount;
     let unit = 'px²';
     if (config.scalePxPerCm > 0) {
@@ -775,7 +758,6 @@ const ShuntWSSAnalyzer = () => {
 
     const avg = frameStressPixels > 0 ? frameTotalStress / frameStressPixels : 0;
 
-    // ✅ ここで state 更新しない。ref に貯めるだけ。
     if (frameCountRef.current % 6 === 0) {
       const evalLabel = avg > 80 ? 'HIGH' : avg > 40 ? 'WARN' : 'NORM';
       metricsRef.current = {
@@ -821,9 +803,9 @@ const ShuntWSSAnalyzer = () => {
 
     setSectorResults(results);
 
-    // 最終的に refs から state へ反映
     setCurrentFrameCount(frameCountRef.current);
     setRealtimeMetrics({ ...metricsRef.current });
+    // ✅ ここで一括更新。解析完了時に初めてグラフデータをStateに入れる。
     setTimeSeriesData([...timeSeriesRef.current]);
 
     drawBullseye(results);
@@ -841,10 +823,8 @@ const ShuntWSSAnalyzer = () => {
       return;
     }
 
-    // 再解析
     if (analysisStatus === '完了') resetAnalysis();
 
-    // 解析開始
     setAnalysisStatus('解析中');
     setIsPlaying(true);
 
@@ -1255,50 +1235,67 @@ const ShuntWSSAnalyzer = () => {
 
             <div className="flex-1 min-h-0 min-w-0 relative">
               <div ref={graphBoxRef} className="w-full min-w-0" style={{ height: 280, minHeight: 260 }}>
-                {/* ✅ FIX 2: isPlaying の切り替えで key を変更し、DOMツリー全体を強制的にリフレッシュ。
-                    また、解析中は Recharts をレンダリングせず、単純なdivを表示する。
-                    これにより insertBefore エラーの要因となる「消えゆくDOMへのアクセス」を遮断する。
-                */}
-                {!isPlaying && graphW > 0 ? (
-                  <div key="result-mode" className="w-full h-full animate-in fade-in duration-500">
-                    {graphMode === 'wss_pressure' ? (
-                      <ComposedChart width={graphW} height={280} data={timeSeriesData}>
-                        <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-                        <XAxis dataKey="frame" stroke="#64748b" tick={{ fontSize: 10 }} label={{ value: 'Frame', position: 'insideBottom', offset: -5, fontSize: 10 }} />
-                        <YAxis yAxisId="left" stroke="#3b82f6" label={{ value: 'Avg WSS', angle: -90, position: 'insideLeft', fontSize: 10, fill: '#3b82f6' }} tick={{ fontSize: 10 }} />
-                        <YAxis yAxisId="right" orientation="right" stroke="#10b981" label={{ value: `Area (${config.scalePxPerCm > 0 ? 'cm²' : 'px²'})`, angle: 90, position: 'insideRight', fontSize: 10, fill: '#10b981' }} tick={{ fontSize: 10 }} domain={['auto', 'auto']} />
-                        <Tooltip contentStyle={{ backgroundColor: '#1e293b', borderColor: '#334155' }} />
-                        <Legend verticalAlign="top" height={36} />
-                        <Line yAxisId="left" type="monotone" dataKey="avgWss" stroke="#3b82f6" strokeWidth={2} name="Avg WSS" dot={false} isAnimationActive={false} />
-                        <Area yAxisId="right" type="monotone" dataKey="area" stroke="#10b981" fill="rgba(16,185,129,0.2)" name="Vessel Area (Pressure Proxy)" isAnimationActive={false} />
-                      </ComposedChart>
-                    ) : graphMode === 'rrt' ? (
-                      <ComposedChart width={graphW} height={280} data={sectorResults}>
-                        <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-                        <XAxis dataKey="angle" stroke="#64748b" tick={{ fontSize: 10 }} label={{ value: 'Angle', position: 'insideBottom', offset: -5, fontSize: 10 }} />
-                        <YAxis stroke="#ef4444" label={{ value: 'RRT', angle: -90, position: 'insideLeft', fontSize: 10, fill: '#ef4444' }} tick={{ fontSize: 10 }} />
-                        <Tooltip contentStyle={{ backgroundColor: '#1e293b', borderColor: '#334155' }} />
-                        <Legend verticalAlign="top" height={36} />
-                        <Area type="monotone" dataKey="rrt" stroke="#ef4444" fill="rgba(239,68,68,0.2)" name="Relative Residence Time" isAnimationActive={false} />
-                      </ComposedChart>
-                    ) : (
-                      <ComposedChart width={graphW} height={280} data={sectorResults}>
-                        <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-                        <XAxis dataKey="angle" stroke="#64748b" tick={{ fontSize: 10 }} label={{ value: 'Angle', position: 'insideBottom', offset: -5, fontSize: 10 }} />
-                        <YAxis yAxisId="left" stroke="#3b82f6" label={{ value: 'TAWSS', angle: -90, position: 'insideLeft', fontSize: 10, fill: '#3b82f6' }} tick={{ fontSize: 10 }} />
-                        <YAxis yAxisId="right" orientation="right" stroke="#f59e0b" label={{ value: 'OSI', angle: 90, position: 'insideRight', fontSize: 10, fill: '#f59e0b' }} tick={{ fontSize: 10 }} domain={[0, 0.5]} />
-                        <Tooltip contentStyle={{ backgroundColor: '#1e293b', borderColor: '#334155' }} />
-                        <Legend verticalAlign="top" height={36} />
-                        <Area yAxisId="left" type="monotone" dataKey="tawss" stroke="#3b82f6" fill="rgba(59,130,246,0.2)" name="TAWSS" isAnimationActive={false} />
-                        <Line yAxisId="right" type="monotone" dataKey="osi" stroke="#f59e0b" strokeWidth={2} dot={false} name="OSI" isAnimationActive={false} />
-                      </ComposedChart>
-                    )}
-                  </div>
-                ) : (
-                  <div key="analysis-mode" className="w-full h-full flex items-center justify-center text-slate-500 text-xs bg-slate-800/50 backdrop-blur-sm">
-                    {isPlaying ? '解析中…（グラフ描画を停止して安定化）' : 'Chart preparing...'}
+                {/* ✅ FIX 2: RechartsをDOMから絶対に消さない。条件付きレンダリングをやめ、CSSで表示/非表示を切り替える */}
+                {/* 解析中は、このコンテナの visibility を hidden にするが、DOMには残す */}
+                
+                {/* メッセージオーバーレイ */}
+                {isPlaying && (
+                  <div className="absolute inset-0 z-10 flex items-center justify-center bg-slate-800/80 backdrop-blur-sm transition-opacity duration-300">
+                    <span className="text-slate-400 text-xs animate-pulse">解析中…（グラフ描画を停止して安定化）</span>
                   </div>
                 )}
+
+                {/* グラフコンテナ (常にレンダリング) */}
+                <div 
+                  className="w-full h-full transition-opacity duration-300"
+                  style={{ 
+                    visibility: isPlaying ? 'hidden' : 'visible',
+                    opacity: isPlaying ? 0 : 1,
+                    // isPlaying中は高さを0にしてレイアウトシフトを防ぎつつDOMを残すテクニックもあるが、
+                    // ここではabsoluteオーバーレイを使うので、グラフはそのまま背景に置いておくのが一番安全。
+                  }}
+                >
+                  {graphW > 0 ? (
+                    <div className="w-full h-full">
+                      {graphMode === 'wss_pressure' ? (
+                        <ComposedChart width={graphW} height={280} data={timeSeriesData}>
+                          <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
+                          <XAxis dataKey="frame" stroke="#64748b" tick={{ fontSize: 10 }} label={{ value: 'Frame', position: 'insideBottom', offset: -5, fontSize: 10 }} />
+                          <YAxis yAxisId="left" stroke="#3b82f6" label={{ value: 'Avg WSS', angle: -90, position: 'insideLeft', fontSize: 10, fill: '#3b82f6' }} tick={{ fontSize: 10 }} />
+                          <YAxis yAxisId="right" orientation="right" stroke="#10b981" label={{ value: `Area (${config.scalePxPerCm > 0 ? 'cm²' : 'px²'})`, angle: 90, position: 'insideRight', fontSize: 10, fill: '#10b981' }} tick={{ fontSize: 10 }} domain={['auto', 'auto']} />
+                          <Tooltip contentStyle={{ backgroundColor: '#1e293b', borderColor: '#334155' }} />
+                          <Legend verticalAlign="top" height={36} />
+                          <Line yAxisId="left" type="monotone" dataKey="avgWss" stroke="#3b82f6" strokeWidth={2} name="Avg WSS" dot={false} isAnimationActive={false} />
+                          <Area yAxisId="right" type="monotone" dataKey="area" stroke="#10b981" fill="rgba(16,185,129,0.2)" name="Vessel Area (Pressure Proxy)" isAnimationActive={false} />
+                        </ComposedChart>
+                      ) : graphMode === 'rrt' ? (
+                        <ComposedChart width={graphW} height={280} data={sectorResults}>
+                          <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
+                          <XAxis dataKey="angle" stroke="#64748b" tick={{ fontSize: 10 }} label={{ value: 'Angle', position: 'insideBottom', offset: -5, fontSize: 10 }} />
+                          <YAxis stroke="#ef4444" label={{ value: 'RRT', angle: -90, position: 'insideLeft', fontSize: 10, fill: '#ef4444' }} tick={{ fontSize: 10 }} />
+                          <Tooltip contentStyle={{ backgroundColor: '#1e293b', borderColor: '#334155' }} />
+                          <Legend verticalAlign="top" height={36} />
+                          <Area type="monotone" dataKey="rrt" stroke="#ef4444" fill="rgba(239,68,68,0.2)" name="Relative Residence Time" isAnimationActive={false} />
+                        </ComposedChart>
+                      ) : (
+                        <ComposedChart width={graphW} height={280} data={sectorResults}>
+                          <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
+                          <XAxis dataKey="angle" stroke="#64748b" tick={{ fontSize: 10 }} label={{ value: 'Angle', position: 'insideBottom', offset: -5, fontSize: 10 }} />
+                          <YAxis yAxisId="left" stroke="#3b82f6" label={{ value: 'TAWSS', angle: -90, position: 'insideLeft', fontSize: 10, fill: '#3b82f6' }} tick={{ fontSize: 10 }} />
+                          <YAxis yAxisId="right" orientation="right" stroke="#f59e0b" label={{ value: 'OSI', angle: 90, position: 'insideRight', fontSize: 10, fill: '#f59e0b' }} tick={{ fontSize: 10 }} domain={[0, 0.5]} />
+                          <Tooltip contentStyle={{ backgroundColor: '#1e293b', borderColor: '#334155' }} />
+                          <Legend verticalAlign="top" height={36} />
+                          <Area yAxisId="left" type="monotone" dataKey="tawss" stroke="#3b82f6" fill="rgba(59,130,246,0.2)" name="TAWSS" isAnimationActive={false} />
+                          <Line yAxisId="right" type="monotone" dataKey="osi" stroke="#f59e0b" strokeWidth={2} dot={false} name="OSI" isAnimationActive={false} />
+                        </ComposedChart>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="w-full h-full flex items-center justify-center text-slate-500 text-xs">
+                      Chart preparing...
+                    </div>
+                  )}
+                </div>
               </div>
 
               {graphComment && !isPlaying && (
