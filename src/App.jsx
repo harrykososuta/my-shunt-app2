@@ -1,4 +1,4 @@
-// ShuntFlow Analytics - v1.0.0 Release Candidate
+  // ShuntFlow Analytics - v1.0.0 Release Candidate
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { Upload, Play, Pause, RotateCcw, Activity, AlertCircle, FileVideo, Crosshair, Gauge, Download, Settings, Ruler, Scan, Layers, Eye, Zap, Move3d, MousePointer2, TrendingUp, Maximize2, X, Sliders, Eraser, Undo, Scissors, ZoomIn, ZoomOut, RefreshCw, Move, Camera } from 'lucide-react';
 import { ComposedChart, Line, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from 'recharts';
@@ -1004,40 +1004,43 @@ const ShuntWSSAnalyzer = () => {
              </div>
              
              <div className="flex-1 min-h-0 min-w-0 relative">
-               <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={260} debounce={50}>
-                  {graphMode === 'wss_pressure' ? (
-                      <ComposedChart data={timeSeriesData}>
-                          <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-                          <XAxis dataKey="frame" stroke="#64748b" tick={{fontSize:10}} label={{ value: 'Frame', position: 'insideBottom', offset: -5, fontSize:10 }}/>
-                          <YAxis yAxisId="left" stroke="#3b82f6" label={{ value: 'Avg WSS', angle: -90, position: 'insideLeft', fontSize:10, fill:'#3b82f6' }} tick={{fontSize:10}} />
-                          <YAxis yAxisId="right" orientation="right" stroke="#10b981" label={{ value: `Area (${config.scalePxPerCm>0?'cm²':'px²'})`, angle: 90, position: 'insideRight', fontSize:10, fill:'#10b981' }} tick={{fontSize:10}} domain={['auto','auto']} />
-                          <Tooltip contentStyle={{backgroundColor:'#1e293b', borderColor:'#334155'}} />
-                          <Legend verticalAlign="top" height={36}/>
-                          <Line yAxisId="left" type="monotone" dataKey="avgWss" stroke="#3b82f6" strokeWidth={2} name="Avg WSS" dot={false} />
-                          <Area yAxisId="right" type="monotone" dataKey="area" stroke="#10b981" fill="rgba(16,185,129,0.2)" name="Vessel Area (Pressure Proxy)" />
-                      </ComposedChart>
-                  ) : graphMode === 'rrt' ? (
-                      <ComposedChart data={sectorResults}>
-                          <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-                          <XAxis dataKey="angle" stroke="#64748b" tick={{fontSize:10}} label={{ value: 'Angle', position: 'insideBottom', offset: -5, fontSize:10 }} />
-                          <YAxis stroke="#ef4444" label={{ value: 'RRT', angle: -90, position: 'insideLeft', fontSize:10, fill:'#ef4444' }} tick={{fontSize:10}} />
-                          <Tooltip contentStyle={{backgroundColor:'#1e293b', borderColor:'#334155'}} />
-                          <Legend verticalAlign="top" height={36}/>
-                          <Area type="monotone" dataKey="rrt" stroke="#ef4444" fill="rgba(239,68,68,0.2)" name="Relative Residence Time" />
-                      </ComposedChart>
-                  ) : (
-                      <ComposedChart data={sectorResults}>
-                          <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-                          <XAxis dataKey="angle" stroke="#64748b" tick={{fontSize:10}} label={{ value: 'Angle', position: 'insideBottom', offset: -5, fontSize:10 }} />
-                          <YAxis yAxisId="left" stroke="#3b82f6" label={{ value: 'TAWSS', angle: -90, position: 'insideLeft', fontSize:10, fill:'#3b82f6' }} tick={{fontSize:10}} />
-                          <YAxis yAxisId="right" orientation="right" stroke="#f59e0b" label={{ value: 'OSI', angle: 90, position: 'insideRight', fontSize:10, fill:'#f59e0b' }} tick={{fontSize:10}} domain={[0, 0.5]} />
-                          <Tooltip contentStyle={{backgroundColor:'#1e293b', borderColor:'#334155'}} />
-                          <Legend verticalAlign="top" height={36}/>
-                          <Area yAxisId="left" type="monotone" dataKey="tawss" stroke="#3b82f6" fill="rgba(59,130,246,0.2)" name="TAWSS" />
-                          <Line yAxisId="right" type="monotone" dataKey="osi" stroke="#f59e0b" strokeWidth={2} dot={false} name="OSI" />
-                      </ComposedChart>
-                  )}
-               </ResponsiveContainer>
+               <div className="w-full min-w-0" style={{ height: 280 }}>
+                 <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={260} debounce={50}>
+                    {graphMode === 'wss_pressure' ? (
+                        <ComposedChart data={timeSeriesData}>
+                            <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
+                            <XAxis dataKey="frame" stroke="#64748b" tick={{fontSize:10}} label={{ value: 'Frame', position: 'insideBottom', offset: -5, fontSize:10 }}/>
+                            <YAxis yAxisId="left" stroke="#3b82f6" label={{ value: 'Avg WSS', angle: -90, position: 'insideLeft', fontSize:10, fill:'#3b82f6' }} tick={{fontSize:10}} />
+                            <YAxis yAxisId="right" orientation="right" stroke="#10b981" label={{ value: `Area (${config.scalePxPerCm>0?'cm²':'px²'})`, angle: 90, position: 'insideRight', fontSize:10, fill:'#10b981' }} tick={{fontSize:10}} domain={['auto','auto']} />
+                            <Tooltip contentStyle={{backgroundColor:'#1e293b', borderColor:'#334155'}} />
+                            <Legend verticalAlign="top" height={36}/>
+                            <Line yAxisId="left" type="monotone" dataKey="avgWss" stroke="#3b82f6" strokeWidth={2} name="Avg WSS" dot={false} />
+                            <Area yAxisId="right" type="monotone" dataKey="area" stroke="#10b981" fill="rgba(16,185,129,0.2)" name="Vessel Area (Pressure Proxy)" />
+                        </ComposedChart>
+                    ) : graphMode === 'rrt' ? (
+                        <ComposedChart data={sectorResults}>
+                            <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
+                            <XAxis dataKey="angle" stroke="#64748b" tick={{fontSize:10}} label={{ value: 'Angle', position: 'insideBottom', offset: -5, fontSize:10 }} />
+                            <YAxis stroke="#ef4444" label={{ value: 'RRT', angle: -90, position: 'insideLeft', fontSize:10, fill:'#ef4444' }} tick={{fontSize:10}} />
+                            <Tooltip contentStyle={{backgroundColor:'#1e293b', borderColor:'#334155'}} />
+                            <Legend verticalAlign="top" height={36}/>
+                            <Area type="monotone" dataKey="rrt" stroke="#ef4444" fill="rgba(239,68,68,0.2)" name="Relative Residence Time" />
+                        </ComposedChart>
+                    ) : (
+                        <ComposedChart data={sectorResults}>
+                            <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
+                            <XAxis dataKey="angle" stroke="#64748b" tick={{fontSize:10}} label={{ value: 'Angle', position: 'insideBottom', offset: -5, fontSize:10 }} />
+                            <YAxis yAxisId="left" stroke="#3b82f6" label={{ value: 'TAWSS', angle: -90, position: 'insideLeft', fontSize:10, fill:'#3b82f6' }} tick={{fontSize:10}} />
+                            <YAxis yAxisId="right" orientation="right" stroke="#f59e0b" label={{ value: 'OSI', angle: 90, position: 'insideRight', fontSize:10, fill:'#f59e0b' }} tick={{fontSize:10}} domain={[0, 0.5]} />
+                            <Tooltip contentStyle={{backgroundColor:'#1e293b', borderColor:'#334155'}} />
+                            <Legend verticalAlign="top" height={36}/>
+                            <Area yAxisId="left" type="monotone" dataKey="tawss" stroke="#3b82f6" fill="rgba(59,130,246,0.2)" name="TAWSS" />
+                            <Line yAxisId="right" type="monotone" dataKey="osi" stroke="#f59e0b" strokeWidth={2} dot={false} name="OSI" />
+                        </ComposedChart>
+                    )}
+                 </ResponsiveContainer>
+                   </div>
+                 </div>
                
                {graphComment && (
                    <div className="absolute bottom-2 left-10 right-10 bg-black/60 text-slate-300 text-xs px-3 py-2 rounded flex items-start gap-2 backdrop-blur-sm border border-slate-700/50">
