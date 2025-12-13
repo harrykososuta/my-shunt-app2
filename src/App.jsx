@@ -1,4 +1,4 @@
-// ShuntFlow Analytics - v1.0.3 (Fix crash by keeping charts mounted but hidden/empty)
+// ShuntFlow Analytics - v1.0.4 (Strict DOM separation and ResizeObserver guard)
 import React, { useState, useRef, useEffect, useLayoutEffect, useCallback } from 'react';
 import {
   Upload, Play, Pause, RotateCcw, Activity, AlertCircle, FileVideo, Crosshair,
@@ -75,18 +75,22 @@ const ShuntWSSAnalyzer = () => {
   const graphBoxRef = useRef(null);
   const [graphW, setGraphW] = useState(0);
 
+  // ✅ FIX 1: 解析中(isPlaying)は ResizeObserver の処理をスキップして State 更新を防ぐ
   useLayoutEffect(() => {
     const el = graphBoxRef.current;
     if (!el) return;
 
     const ro = new ResizeObserver(([entry]) => {
+      // 解析中はサイズ変更があっても無視（再レンダリング連鎖を防ぐ）
+      if (isPlaying) return;
+
       const w = Math.floor(entry.contentRect.width);
       setGraphW(w > 10 ? w : 0);
     });
 
     ro.observe(el);
     return () => ro.disconnect();
-  }, []);
+  }, [isPlaying]); // isPlayingが変わるたびにObserverを再設定
 
   const makeSectorAccumulator = (n) =>
     Array(n).fill(0).map(() => ({
@@ -1251,64 +1255,53 @@ const ShuntWSSAnalyzer = () => {
 
             <div className="flex-1 min-h-0 min-w-0 relative">
               <div ref={graphBoxRef} className="w-full min-w-0" style={{ height: 280, minHeight: 260 }}>
-                {/* ✅ FIX: 条件付きレンダリングをやめ、常にマウント状態を維持する。
-                    代わりに CSS で表示を制御し、重い処理中は空データを渡すことで
-                    React の DOM 操作 (insertBefore) エラーを完全に回避する。
+                {/* ✅ FIX 2: isPlaying の切り替えで key を変更し、DOMツリー全体を強制的にリフレッシュ。
+                    また、解析中は Recharts をレンダリングせず、単純なdivを表示する。
+                    これにより insertBefore エラーの要因となる「消えゆくDOMへのアクセス」を遮断する。
                 */}
-
-                {/* 解析中メッセージ（重ね合わせ） */}
-                <div 
-                  className={`w-full h-full flex items-center justify-center text-slate-500 text-xs absolute inset-0 z-10 bg-slate-800/50 backdrop-blur-sm transition-opacity duration-300 ${isPlaying ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'}`}
-                >
-                  解析中…（グラフ描画を停止して安定化）
-                </div>
-
-                {/* グラフ本体（常にマウント、isPlaying時は非表示＆データ空） */}
-                <div className={`w-full h-full ${isPlaying ? 'invisible' : 'visible'}`}>
-                  {graphW > 0 ? (
-                    <div className="w-full h-full">
-                      {graphMode === 'wss_pressure' ? (
-                        <ComposedChart width={graphW} height={280} data={isPlaying ? [] : timeSeriesData}>
-                          <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-                          <XAxis dataKey="frame" stroke="#64748b" tick={{ fontSize: 10 }} label={{ value: 'Frame', position: 'insideBottom', offset: -5, fontSize: 10 }} />
-                          <YAxis yAxisId="left" stroke="#3b82f6" label={{ value: 'Avg WSS', angle: -90, position: 'insideLeft', fontSize: 10, fill: '#3b82f6' }} tick={{ fontSize: 10 }} />
-                          <YAxis yAxisId="right" orientation="right" stroke="#10b981" label={{ value: `Area (${config.scalePxPerCm > 0 ? 'cm²' : 'px²'})`, angle: 90, position: 'insideRight', fontSize: 10, fill: '#10b981' }} tick={{ fontSize: 10 }} domain={['auto', 'auto']} />
-                          <Tooltip contentStyle={{ backgroundColor: '#1e293b', borderColor: '#334155' }} />
-                          <Legend verticalAlign="top" height={36} />
-                          <Line yAxisId="left" type="monotone" dataKey="avgWss" stroke="#3b82f6" strokeWidth={2} name="Avg WSS" dot={false} isAnimationActive={false} />
-                          <Area yAxisId="right" type="monotone" dataKey="area" stroke="#10b981" fill="rgba(16,185,129,0.2)" name="Vessel Area (Pressure Proxy)" isAnimationActive={false} />
-                        </ComposedChart>
-                      ) : graphMode === 'rrt' ? (
-                        <ComposedChart width={graphW} height={280} data={isPlaying ? [] : sectorResults}>
-                          <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-                          <XAxis dataKey="angle" stroke="#64748b" tick={{ fontSize: 10 }} label={{ value: 'Angle', position: 'insideBottom', offset: -5, fontSize: 10 }} />
-                          <YAxis stroke="#ef4444" label={{ value: 'RRT', angle: -90, position: 'insideLeft', fontSize: 10, fill: '#ef4444' }} tick={{ fontSize: 10 }} />
-                          <Tooltip contentStyle={{ backgroundColor: '#1e293b', borderColor: '#334155' }} />
-                          <Legend verticalAlign="top" height={36} />
-                          <Area type="monotone" dataKey="rrt" stroke="#ef4444" fill="rgba(239,68,68,0.2)" name="Relative Residence Time" isAnimationActive={false} />
-                        </ComposedChart>
-                      ) : (
-                        <ComposedChart width={graphW} height={280} data={isPlaying ? [] : sectorResults}>
-                          <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-                          <XAxis dataKey="angle" stroke="#64748b" tick={{ fontSize: 10 }} label={{ value: 'Angle', position: 'insideBottom', offset: -5, fontSize: 10 }} />
-                          <YAxis yAxisId="left" stroke="#3b82f6" label={{ value: 'TAWSS', angle: -90, position: 'insideLeft', fontSize: 10, fill: '#3b82f6' }} tick={{ fontSize: 10 }} />
-                          <YAxis yAxisId="right" orientation="right" stroke="#f59e0b" label={{ value: 'OSI', angle: 90, position: 'insideRight', fontSize: 10, fill: '#f59e0b' }} tick={{ fontSize: 10 }} domain={[0, 0.5]} />
-                          <Tooltip contentStyle={{ backgroundColor: '#1e293b', borderColor: '#334155' }} />
-                          <Legend verticalAlign="top" height={36} />
-                          <Area yAxisId="left" type="monotone" dataKey="tawss" stroke="#3b82f6" fill="rgba(59,130,246,0.2)" name="TAWSS" isAnimationActive={false} />
-                          <Line yAxisId="right" type="monotone" dataKey="osi" stroke="#f59e0b" strokeWidth={2} dot={false} name="OSI" isAnimationActive={false} />
-                        </ComposedChart>
-                      )}
-                    </div>
-                  ) : (
-                    <div className="w-full h-full flex items-center justify-center text-slate-500 text-xs">
-                      Chart preparing...
-                    </div>
-                  )}
-                </div>
+                {!isPlaying && graphW > 0 ? (
+                  <div key="result-mode" className="w-full h-full animate-in fade-in duration-500">
+                    {graphMode === 'wss_pressure' ? (
+                      <ComposedChart width={graphW} height={280} data={timeSeriesData}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
+                        <XAxis dataKey="frame" stroke="#64748b" tick={{ fontSize: 10 }} label={{ value: 'Frame', position: 'insideBottom', offset: -5, fontSize: 10 }} />
+                        <YAxis yAxisId="left" stroke="#3b82f6" label={{ value: 'Avg WSS', angle: -90, position: 'insideLeft', fontSize: 10, fill: '#3b82f6' }} tick={{ fontSize: 10 }} />
+                        <YAxis yAxisId="right" orientation="right" stroke="#10b981" label={{ value: `Area (${config.scalePxPerCm > 0 ? 'cm²' : 'px²'})`, angle: 90, position: 'insideRight', fontSize: 10, fill: '#10b981' }} tick={{ fontSize: 10 }} domain={['auto', 'auto']} />
+                        <Tooltip contentStyle={{ backgroundColor: '#1e293b', borderColor: '#334155' }} />
+                        <Legend verticalAlign="top" height={36} />
+                        <Line yAxisId="left" type="monotone" dataKey="avgWss" stroke="#3b82f6" strokeWidth={2} name="Avg WSS" dot={false} isAnimationActive={false} />
+                        <Area yAxisId="right" type="monotone" dataKey="area" stroke="#10b981" fill="rgba(16,185,129,0.2)" name="Vessel Area (Pressure Proxy)" isAnimationActive={false} />
+                      </ComposedChart>
+                    ) : graphMode === 'rrt' ? (
+                      <ComposedChart width={graphW} height={280} data={sectorResults}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
+                        <XAxis dataKey="angle" stroke="#64748b" tick={{ fontSize: 10 }} label={{ value: 'Angle', position: 'insideBottom', offset: -5, fontSize: 10 }} />
+                        <YAxis stroke="#ef4444" label={{ value: 'RRT', angle: -90, position: 'insideLeft', fontSize: 10, fill: '#ef4444' }} tick={{ fontSize: 10 }} />
+                        <Tooltip contentStyle={{ backgroundColor: '#1e293b', borderColor: '#334155' }} />
+                        <Legend verticalAlign="top" height={36} />
+                        <Area type="monotone" dataKey="rrt" stroke="#ef4444" fill="rgba(239,68,68,0.2)" name="Relative Residence Time" isAnimationActive={false} />
+                      </ComposedChart>
+                    ) : (
+                      <ComposedChart width={graphW} height={280} data={sectorResults}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
+                        <XAxis dataKey="angle" stroke="#64748b" tick={{ fontSize: 10 }} label={{ value: 'Angle', position: 'insideBottom', offset: -5, fontSize: 10 }} />
+                        <YAxis yAxisId="left" stroke="#3b82f6" label={{ value: 'TAWSS', angle: -90, position: 'insideLeft', fontSize: 10, fill: '#3b82f6' }} tick={{ fontSize: 10 }} />
+                        <YAxis yAxisId="right" orientation="right" stroke="#f59e0b" label={{ value: 'OSI', angle: 90, position: 'insideRight', fontSize: 10, fill: '#f59e0b' }} tick={{ fontSize: 10 }} domain={[0, 0.5]} />
+                        <Tooltip contentStyle={{ backgroundColor: '#1e293b', borderColor: '#334155' }} />
+                        <Legend verticalAlign="top" height={36} />
+                        <Area yAxisId="left" type="monotone" dataKey="tawss" stroke="#3b82f6" fill="rgba(59,130,246,0.2)" name="TAWSS" isAnimationActive={false} />
+                        <Line yAxisId="right" type="monotone" dataKey="osi" stroke="#f59e0b" strokeWidth={2} dot={false} name="OSI" isAnimationActive={false} />
+                      </ComposedChart>
+                    )}
+                  </div>
+                ) : (
+                  <div key="analysis-mode" className="w-full h-full flex items-center justify-center text-slate-500 text-xs bg-slate-800/50 backdrop-blur-sm">
+                    {isPlaying ? '解析中…（グラフ描画を停止して安定化）' : 'Chart preparing...'}
+                  </div>
+                )}
               </div>
 
-              {graphComment && (
+              {graphComment && !isPlaying && (
                 <div className="absolute bottom-2 left-10 right-10 bg-black/60 text-slate-300 text-xs px-3 py-2 rounded flex items-start gap-2 backdrop-blur-sm border border-slate-700/50">
                   <TrendingUp className="w-4 h-4 text-blue-400 mt-0.5 flex-shrink-0" />
                   <span>{graphComment}</span>
