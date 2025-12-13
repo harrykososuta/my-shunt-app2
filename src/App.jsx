@@ -1,12 +1,12 @@
 // ShuntFlow Analytics - v1.0.0 Release Candidate
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useLayoutEffect, useCallback } from 'react';
 import {
   Upload, Play, Pause, RotateCcw, Activity, AlertCircle, FileVideo, Crosshair,
   Download, Settings, Ruler, Scan, Eye, Zap, Move3d, MousePointer2, TrendingUp,
   Maximize2, X, Sliders, Eraser, Undo, ZoomIn, ZoomOut, RefreshCw, Move, Camera
 } from 'lucide-react';
 import {
-  ComposedChart, Line, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend
+  ComposedChart, Line, Area, XAxis, YAxis, CartesianGrid, Tooltip, Legend
 } from 'recharts';
 
 const ShuntWSSAnalyzer = () => {
@@ -66,6 +66,23 @@ const ShuntWSSAnalyzer = () => {
   const modalCanvasRef = useRef(null);
   const animationRef = useRef(null);
   const containerRef = useRef(null);
+
+  // ✅ グラフの親幅を測って ComposedChart に渡す（ResponsiveContainer をやめる）
+  const graphBoxRef = useRef(null);
+  const [graphW, setGraphW] = useState(0);
+
+  useLayoutEffect(() => {
+    const el = graphBoxRef.current;
+    if (!el) return;
+
+    const ro = new ResizeObserver(([entry]) => {
+      const w = Math.floor(entry.contentRect.width);
+      setGraphW(w > 10 ? w : 0);
+    });
+
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
   const makeSectorAccumulator = (n) =>
     Array(n).fill(0).map(() => ({
@@ -351,6 +368,113 @@ const ShuntWSSAnalyzer = () => {
     setZoomLevel(prev => e.deltaY < 0 ? Math.min(prev * scaleFactor, 5.0) : Math.max(prev / scaleFactor, 0.2));
   };
 
+  // --- 3D描画 ---
+  const drawStack = useCallback((buffer, canvas, isLarge) => {
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const w = canvas.width, h = canvas.height;
+
+    ctx.fillStyle = '#0f172a';
+    ctx.fillRect(0, 0, w, h);
+
+    if (buffer.length === 0) {
+      ctx.fillStyle = '#475569'; ctx.font = '12px sans-serif'; ctx.textAlign = 'center';
+      ctx.fillText("No Vessel Shape Data", w / 2, h / 2);
+      return;
+    }
+
+    const cx = w / 2 + (isLarge ? pan3D.x : 0);
+    const cy = h / 2 + (isLarge ? pan3D.y : 0);
+    const scale = isLarge ? zoomLevel : 0.5;
+
+    const visibleCount = isLarge ? 300 : 100;
+    const showFrames = buffer.slice(-visibleCount);
+
+    const rotate = (x, y, z, ax, ay) => {
+      let y1 = y * Math.cos(ax) - z * Math.sin(ax);
+      let z1 = y * Math.sin(ax) + z * Math.cos(ax);
+      let x2 = x * Math.cos(ay) + z1 * Math.sin(ay);
+      let z2 = -x * Math.sin(ay) + z1 * Math.cos(ay);
+      return { x: x2, y: y1, z: z2 };
+    };
+
+    const hasNeighbor = (p, frameIdx, currentSliceIdx) => {
+      if (noiseFilterLevel === 0) return true;
+      const range = noiseFilterLevel * 3;
+      if (currentSliceIdx > 0) {
+        const prevSlice = showFrames[currentSliceIdx - 1];
+        for (let pp of prevSlice.vesselPoints) {
+          if (Math.abs(pp.x - p.x) < range && Math.abs(pp.y - p.y) < range) return true;
+        }
+      }
+      if (currentSliceIdx < showFrames.length - 1) {
+        const nextSlice = showFrames[currentSliceIdx + 1];
+        for (let np of nextSlice.vesselPoints) {
+          if (Math.abs(np.x - p.x) < range && Math.abs(np.y - p.y) < range) return true;
+        }
+      }
+      return false;
+    };
+
+    showFrames.forEach((slice, idx) => {
+      const zBase = (idx - showFrames.length / 2) * (isLarge ? 3 : 2);
+      const alphaBase = 0.2 + (idx / showFrames.length) * 0.8;
+
+      ctx.strokeStyle = `rgba(200, 230, 255, ${alphaBase * 0.5})`;
+      ctx.lineWidth = 0.5;
+      ctx.fillStyle = `rgba(220, 240, 255, ${alphaBase})`;
+
+      const projectedPoints = [];
+
+      slice.vesselPoints.forEach(p => {
+        if (!hasNeighbor(p, slice.frame, idx)) return;
+
+        const r = rotate(p.x, p.y, zBase, rot3D.x, rot3D.y);
+        const perspective = 400 / (400 - r.z);
+        const px = cx + r.x * scale * perspective;
+        const py = cy + r.y * scale * perspective;
+
+        projectedPoints.push({ x: px, y: py, z: r.z });
+
+        const size = isLarge ? 1.5 * perspective : 1.2;
+        ctx.fillRect(px, py, size, size);
+      });
+
+      if (isLarge && idx > 0 && idx % 2 === 0) {
+        ctx.beginPath();
+        projectedPoints.forEach((p, pIdx) => {
+          if (pIdx > 0 && Math.abs(p.x - projectedPoints[pIdx - 1].x) < 10 && Math.abs(p.y - projectedPoints[pIdx - 1].y) < 10) {
+            ctx.moveTo(p.x, p.y);
+            ctx.lineTo(projectedPoints[pIdx - 1].x, projectedPoints[pIdx - 1].y);
+          }
+        });
+        ctx.stroke();
+      }
+    });
+
+    // 選択ボックス描画
+    if (isLarge && interactionMode === 'delete' && selectionBox) {
+      const { sx, sy, cx, cy } = selectionBox;
+      ctx.strokeStyle = '#ef4444';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([5, 3]);
+      ctx.strokeRect(sx, sy, cx - sx, cy - sy);
+      ctx.setLineDash([]);
+      ctx.fillStyle = 'rgba(239, 68, 68, 0.1)';
+      ctx.fillRect(sx, sy, cx - sx, cy - sy);
+    }
+
+    ctx.strokeStyle = '#475569'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(w - 30, h - 30); ctx.lineTo(w - 10, h - 30); ctx.stroke(); ctx.fillText('X', w - 10, h - 35);
+    ctx.beginPath(); ctx.moveTo(w - 30, h - 30); ctx.lineTo(w - 30, h - 10); ctx.stroke(); ctx.fillText('Y', w - 35, h - 10);
+
+  }, [rot3D, pan3D, noiseFilterLevel, interactionMode, selectionBox, zoomLevel]);
+
+  useEffect(() => {
+    drawStack(accumulationRef.current.stackBuffer, stackCanvasRef.current, false);
+    if (is3DModalOpen) drawStack(accumulationRef.current.stackBuffer, stackCanvasLargeRef.current, true);
+  }, [drawStack, is3DModalOpen]);
+
   // 3D点群の削除処理
   const deleteSelectedPoints = () => {
     if (!selectionBox || !stackCanvasLargeRef.current) return;
@@ -610,113 +734,6 @@ const ShuntWSSAnalyzer = () => {
       setAnalysisStatus("エラー");
     }
   }, [config, is3DModalOpen, drawStack]);
-
-  // --- 3D描画 ---
-  const drawStack = useCallback((buffer, canvas, isLarge) => {
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    const w = canvas.width, h = canvas.height;
-
-    ctx.fillStyle = '#0f172a';
-    ctx.fillRect(0, 0, w, h);
-
-    if (buffer.length === 0) {
-      ctx.fillStyle = '#475569'; ctx.font = '12px sans-serif'; ctx.textAlign = 'center';
-      ctx.fillText("No Vessel Shape Data", w / 2, h / 2);
-      return;
-    }
-
-    const cx = w / 2 + (isLarge ? pan3D.x : 0);
-    const cy = h / 2 + (isLarge ? pan3D.y : 0);
-    const scale = isLarge ? zoomLevel : 0.5;
-
-    const visibleCount = isLarge ? 300 : 100;
-    const showFrames = buffer.slice(-visibleCount);
-
-    const rotate = (x, y, z, ax, ay) => {
-      let y1 = y * Math.cos(ax) - z * Math.sin(ax);
-      let z1 = y * Math.sin(ax) + z * Math.cos(ax);
-      let x2 = x * Math.cos(ay) + z1 * Math.sin(ay);
-      let z2 = -x * Math.sin(ay) + z1 * Math.cos(ay);
-      return { x: x2, y: y1, z: z2 };
-    };
-
-    const hasNeighbor = (p, frameIdx, currentSliceIdx) => {
-      if (noiseFilterLevel === 0) return true;
-      const range = noiseFilterLevel * 3;
-      if (currentSliceIdx > 0) {
-        const prevSlice = showFrames[currentSliceIdx - 1];
-        for (let pp of prevSlice.vesselPoints) {
-          if (Math.abs(pp.x - p.x) < range && Math.abs(pp.y - p.y) < range) return true;
-        }
-      }
-      if (currentSliceIdx < showFrames.length - 1) {
-        const nextSlice = showFrames[currentSliceIdx + 1];
-        for (let np of nextSlice.vesselPoints) {
-          if (Math.abs(np.x - p.x) < range && Math.abs(np.y - p.y) < range) return true;
-        }
-      }
-      return false;
-    };
-
-    showFrames.forEach((slice, idx) => {
-      const zBase = (idx - showFrames.length / 2) * (isLarge ? 3 : 2);
-      const alphaBase = 0.2 + (idx / showFrames.length) * 0.8;
-
-      ctx.strokeStyle = `rgba(200, 230, 255, ${alphaBase * 0.5})`;
-      ctx.lineWidth = 0.5;
-      ctx.fillStyle = `rgba(220, 240, 255, ${alphaBase})`;
-
-      const projectedPoints = [];
-
-      slice.vesselPoints.forEach(p => {
-        if (!hasNeighbor(p, slice.frame, idx)) return;
-
-        const r = rotate(p.x, p.y, zBase, rot3D.x, rot3D.y);
-        const perspective = 400 / (400 - r.z);
-        const px = cx + r.x * scale * perspective;
-        const py = cy + r.y * scale * perspective;
-
-        projectedPoints.push({ x: px, y: py, z: r.z });
-
-        const size = isLarge ? 1.5 * perspective : 1.2;
-        ctx.fillRect(px, py, size, size);
-      });
-
-      if (isLarge && idx > 0 && idx % 2 === 0) {
-        ctx.beginPath();
-        projectedPoints.forEach((p, pIdx) => {
-          if (pIdx > 0 && Math.abs(p.x - projectedPoints[pIdx - 1].x) < 10 && Math.abs(p.y - projectedPoints[pIdx - 1].y) < 10) {
-            ctx.moveTo(p.x, p.y);
-            ctx.lineTo(projectedPoints[pIdx - 1].x, projectedPoints[pIdx - 1].y);
-          }
-        });
-        ctx.stroke();
-      }
-    });
-
-    // 選択ボックス描画
-    if (isLarge && interactionMode === 'delete' && selectionBox) {
-      const { sx, sy, cx, cy } = selectionBox;
-      ctx.strokeStyle = '#ef4444';
-      ctx.lineWidth = 2;
-      ctx.setLineDash([5, 3]);
-      ctx.strokeRect(sx, sy, cx - sx, cy - sy);
-      ctx.setLineDash([]);
-      ctx.fillStyle = 'rgba(239, 68, 68, 0.1)';
-      ctx.fillRect(sx, sy, cx - sx, cy - sy);
-    }
-
-    ctx.strokeStyle = '#475569'; ctx.lineWidth = 1;
-    ctx.beginPath(); ctx.moveTo(w - 30, h - 30); ctx.lineTo(w - 10, h - 30); ctx.stroke(); ctx.fillText('X', w - 10, h - 35);
-    ctx.beginPath(); ctx.moveTo(w - 30, h - 30); ctx.lineTo(w - 30, h - 10); ctx.stroke(); ctx.fillText('Y', w - 35, h - 10);
-
-  }, [rot3D, pan3D, noiseFilterLevel, interactionMode, selectionBox, zoomLevel]);
-
-  useEffect(() => {
-    drawStack(accumulationRef.current.stackBuffer, stackCanvasRef.current, false);
-    if (is3DModalOpen) drawStack(accumulationRef.current.stackBuffer, stackCanvasLargeRef.current, true);
-  }, [drawStack, is3DModalOpen]);
 
   const togglePlay = () => {
     if (!videoRef.current) return;
@@ -1021,11 +1038,15 @@ const ShuntWSSAnalyzer = () => {
             </div>
 
             <div className="flex-1 min-h-0 min-w-0 relative">
-              {/* ★重要：ResponsiveContainer を固定高さで安定化（width/height=-1 を潰す） */}
-              <div className="w-full min-w-0" style={{ height: 280, minHeight: 260 }}>
-                <ResponsiveContainer width="100%" height={280}>
-                  {graphMode === 'wss_pressure' ? (
-                    <ComposedChart data={timeSeriesData}>
+              {/* ✅ ResponsiveContainer を廃止：親幅を測って width/height を直接渡す */}
+              <div
+                ref={graphBoxRef}
+                className="w-full min-w-0"
+                style={{ height: 280, minHeight: 260 }}
+              >
+                {graphW > 0 ? (
+                  graphMode === 'wss_pressure' ? (
+                    <ComposedChart width={graphW} height={280} data={timeSeriesData}>
                       <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
                       <XAxis dataKey="frame" stroke="#64748b" tick={{ fontSize: 10 }} label={{ value: 'Frame', position: 'insideBottom', offset: -5, fontSize: 10 }} />
                       <YAxis yAxisId="left" stroke="#3b82f6" label={{ value: 'Avg WSS', angle: -90, position: 'insideLeft', fontSize: 10, fill: '#3b82f6' }} tick={{ fontSize: 10 }} />
@@ -1036,7 +1057,7 @@ const ShuntWSSAnalyzer = () => {
                       <Area yAxisId="right" type="monotone" dataKey="area" stroke="#10b981" fill="rgba(16,185,129,0.2)" name="Vessel Area (Pressure Proxy)" />
                     </ComposedChart>
                   ) : graphMode === 'rrt' ? (
-                    <ComposedChart data={sectorResults}>
+                    <ComposedChart width={graphW} height={280} data={sectorResults}>
                       <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
                       <XAxis dataKey="angle" stroke="#64748b" tick={{ fontSize: 10 }} label={{ value: 'Angle', position: 'insideBottom', offset: -5, fontSize: 10 }} />
                       <YAxis stroke="#ef4444" label={{ value: 'RRT', angle: -90, position: 'insideLeft', fontSize: 10, fill: '#ef4444' }} tick={{ fontSize: 10 }} />
@@ -1045,7 +1066,7 @@ const ShuntWSSAnalyzer = () => {
                       <Area type="monotone" dataKey="rrt" stroke="#ef4444" fill="rgba(239,68,68,0.2)" name="Relative Residence Time" />
                     </ComposedChart>
                   ) : (
-                    <ComposedChart data={sectorResults}>
+                    <ComposedChart width={graphW} height={280} data={sectorResults}>
                       <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
                       <XAxis dataKey="angle" stroke="#64748b" tick={{ fontSize: 10 }} label={{ value: 'Angle', position: 'insideBottom', offset: -5, fontSize: 10 }} />
                       <YAxis yAxisId="left" stroke="#3b82f6" label={{ value: 'TAWSS', angle: -90, position: 'insideLeft', fontSize: 10, fill: '#3b82f6' }} tick={{ fontSize: 10 }} />
@@ -1055,8 +1076,12 @@ const ShuntWSSAnalyzer = () => {
                       <Area yAxisId="left" type="monotone" dataKey="tawss" stroke="#3b82f6" fill="rgba(59,130,246,0.2)" name="TAWSS" />
                       <Line yAxisId="right" type="monotone" dataKey="osi" stroke="#f59e0b" strokeWidth={2} dot={false} name="OSI" />
                     </ComposedChart>
-                  )}
-                </ResponsiveContainer>
+                  )
+                ) : (
+                  <div className="w-full h-full flex items-center justify-center text-slate-500 text-xs">
+                    Chart preparing...
+                  </div>
+                )}
               </div>
 
               {graphComment && (
