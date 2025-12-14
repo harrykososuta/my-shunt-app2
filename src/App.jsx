@@ -94,15 +94,27 @@ const ShuntWSSAnalyzer = () => {
     const el = graphBoxRef.current;
     if (!el) return;
 
-    const ro = new ResizeObserver(([entry]) => {
+    const measure = () => {
+      const w = Math.floor(el.getBoundingClientRect().width);
+      setGraphW(w > 10 ? w : 0);
+    };
+
+    // ✅ 重要：最初に必ず測る（ResizeObserver待ちで0のままにならない）
+    measure();
+
+    const ro = new ResizeObserver(() => {
       // 解析中はリサイズイベントを無視して再レンダリングを防ぐ
       if (isPlaying) return;
-      const w = Math.floor(entry.contentRect.width);
-      setGraphW(w > 10 ? w : 0);
+      measure();
     });
 
     ro.observe(el);
-    return () => ro.disconnect();
+    window.addEventListener('resize', measure);
+
+    return () => {
+      ro.disconnect();
+      window.removeEventListener('resize', measure);
+    };
   }, [isPlaying]);
 
   const makeSectorAccumulator = (n) =>
@@ -1294,7 +1306,7 @@ const ShuntWSSAnalyzer = () => {
             </div>
 
             <div className="flex-1 min-h-0 min-w-0 relative">
-              <div ref={graphBoxRef} className="w-full min-w-0" style={{ height: 280, minHeight: 260 }}>
+              <div ref={graphBoxRef} className="w-full min-w-0 relative" style={{ height: 280, minHeight: 260 }}>
                 {isPlaying && (
                   <div className="absolute inset-0 z-10 flex items-center justify-center bg-slate-800/80 backdrop-blur-sm transition-opacity duration-300">
                     <span className="text-slate-400 text-xs animate-pulse">解析中…（グラフ描画を停止して安定化）</span>
