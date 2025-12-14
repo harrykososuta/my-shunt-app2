@@ -71,17 +71,6 @@ const ShuntWSSAnalyzer = () => {
   const animationRef = useRef(null);
   const containerRef = useRef(null);
 
-  // ✅ Canvas 2D context is reused to avoid creating multiple contexts with different attributes
-  const ctx2dRef = useRef(null);
-  const get2dCtx = useCallback((canvas) => {
-    if (!canvas) return null;
-    const ctx = ctx2dRef.current;
-    if (ctx && ctx.canvas === canvas) return ctx;
-    const next = canvas.getContext('2d', { willReadFrequently: true });
-    ctx2dRef.current = next;
-    return next;
-  }, []);
-
   // refs for heavy updates
   const frameCountRef = useRef(0);
   const metricsRef = useRef({ avg: 0, max: 0, area: 0, evaluation: '-' });
@@ -139,23 +128,6 @@ const ShuntWSSAnalyzer = () => {
       animationRef.current = null;
     }
   };
-
-
-  // ✅ Clean up on unmount (important for Vite HMR / React dev to prevent DOM reconciliation crashes)
-  useEffect(() => {
-    return () => {
-      // stop RAF loop
-      if (animationRef.current) {
-        cancelAnimationFrame(animationRef.current);
-        animationRef.current = null;
-      }
-      // stop UI timer
-      if (uiTimerRef.current) {
-        clearInterval(uiTimerRef.current);
-        uiTimerRef.current = null;
-      }
-    };
-  }, []);
 
   // ✅ 追加：コンポーネントが外れる時に完全停止（insertBefore系クラッシュ予防）
   useEffect(() => {
@@ -280,7 +252,7 @@ const ShuntWSSAnalyzer = () => {
     const canvas = canvasRef.current;
     if (!video || !canvas) return;
 
-    const ctx = get2dCtx(canvas);
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
     if (!ctx) return;
 
     if (video.videoWidth > 0 && (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight)) {
@@ -471,7 +443,7 @@ const ShuntWSSAnalyzer = () => {
 
   const drawStack = useCallback((buffer, canvas, isLarge) => {
     if (!canvas) return;
-    const ctx = get2dCtx(canvas);
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
     if (!ctx) return;
 
     const w = canvas.width, h = canvas.height;
@@ -653,7 +625,7 @@ const ShuntWSSAnalyzer = () => {
 
     if (video.paused || video.ended) return;
 
-    const ctx = get2dCtx(canvas);
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
     if (!ctx) return;
 
     if (canvas.width !== video.videoWidth && video.videoWidth > 0) {
@@ -1233,7 +1205,17 @@ const ShuntWSSAnalyzer = () => {
                       : 'bg-blue-600 hover:bg-blue-500 text-white'
               }`}
             >
-              {isPlaying ? <><Pause className="w-5 h-5" /> 停止</> : analysisStatus === '完了' ? <><RotateCcw className="w-5 h-5" /> 再解析</> : <><Play className="w-5 h-5" /> 解析開始</>}
+              {(() => {
+                const Icon = isPlaying ? Pause : (analysisStatus === '完了' ? RotateCcw : Play);
+                const label = isPlaying ? '停止' : (analysisStatus === '完了' ? '再解析' : '解析開始');
+                const key = isPlaying ? 'pause' : (analysisStatus === '完了' ? 're' : 'play');
+                return (
+                  <span className="inline-flex items-center gap-2" key={key}>
+                    <Icon className="w-5 h-5" />
+                    {label}
+                  </span>
+                );
+              })()}
             </button>
           </div>
 
