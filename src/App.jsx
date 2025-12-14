@@ -1,4 +1,10 @@
-// ShuntFlow Analytics - v1.0.5 (Fix crash by preventing unmount & state updates during play)
+// src/App.jsx
+// ShuntFlow Analytics - v1.0.6
+// Fix crash (insertBefore / NotFoundError) by:
+// 1) Hard cleanup on unmount (RAF / interval / video)
+// 2) Start-play always clears previous RAF/interval before play
+// 3) Guard async callbacks with mountedRef
+
 import React, { useState, useRef, useEffect, useLayoutEffect, useCallback } from 'react';
 import {
   Upload, Play, Pause, RotateCcw, Activity, AlertCircle, FileVideo, Crosshair,
@@ -65,13 +71,33 @@ const ShuntWSSAnalyzer = () => {
   const animationRef = useRef(null);
   const containerRef = useRef(null);
 
+  // ✅ Canvas 2D context is reused to avoid creating multiple contexts with different attributes
+  const ctx2dRef = useRef(null);
+  const get2dCtx = useCallback((canvas) => {
+    if (!canvas) return null;
+    const ctx = ctx2dRef.current;
+    if (ctx && ctx.canvas === canvas) return ctx;
+    const next = canvas.getContext('2d', { willReadFrequently: true });
+    ctx2dRef.current = next;
+    return next;
+  }, []);
+
   // refs for heavy updates
   const frameCountRef = useRef(0);
   const metricsRef = useRef({ avg: 0, max: 0, area: 0, evaluation: '-' });
   const timeSeriesRef = useRef([]);
   const uiTimerRef = useRef(null);
 
-  // ✅ グラフ幅: ResizeObserver は常時監視するが、isPlaying中はstate更新をスキップするガードを入れる
+  // ✅ mounted guard（StrictModeなどで一瞬unmountされてもsetStateしない）
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  // ✅ グラフ幅
   const graphBoxRef = useRef(null);
   const [graphW, setGraphW] = useState(0);
 
@@ -107,8 +133,49 @@ const ShuntWSSAnalyzer = () => {
     stackBuffer: []
   });
 
+  const safeCancelRAF = () => {
+    if (animationRef.current) {
+      cancelAnimationFrame(animationRef.current);
+      animationRef.current = null;
+    }
+  };
+
+
+  // ✅ Clean up on unmount (important for Vite HMR / React dev to prevent DOM reconciliation crashes)
+  useEffect(() => {
+    return () => {
+      // stop RAF loop
+      if (animationRef.current) {
+        cancelAnimationFrame(animationRef.current);
+        animationRef.current = null;
+      }
+      // stop UI timer
+      if (uiTimerRef.current) {
+        clearInterval(uiTimerRef.current);
+        uiTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  // ✅ 追加：コンポーネントが外れる時に完全停止（insertBefore系クラッシュ予防）
+  useEffect(() => {
+    return () => {
+      safeCancelRAF();
+
+      if (uiTimerRef.current) {
+        clearInterval(uiTimerRef.current);
+        uiTimerRef.current = null;
+      }
+
+      if (videoRef.current) {
+        try {
+          videoRef.current.pause();
+        } catch (_) {}
+      }
+    };
+  }, []);
+
   // ✅ FIX 1: 解析中は「重いグラフデータ(timeSeriesData)」をStateに入れない
-  // これにより、見えていないグラフが裏で再レンダリングされるのを防ぐ
   useEffect(() => {
     if (!isPlaying) {
       if (uiTimerRef.current) {
@@ -119,9 +186,11 @@ const ShuntWSSAnalyzer = () => {
     }
 
     uiTimerRef.current = setInterval(() => {
+      // mountedガード
+      if (!mountedRef.current) return;
+
       setCurrentFrameCount(frameCountRef.current);
       setRealtimeMetrics({ ...metricsRef.current });
-      // ❌ 削除: setTimeSeriesData([...timeSeriesRef.current]);
       // 解析中はグラフ更新をしない。完了時に一括更新する。
     }, 250);
 
@@ -133,19 +202,14 @@ const ShuntWSSAnalyzer = () => {
     };
   }, [isPlaying]);
 
-  const safeCancelRAF = () => {
-    if (animationRef.current) {
-      cancelAnimationFrame(animationRef.current);
-      animationRef.current = null;
-    }
-  };
-
   const resetAnalysis = () => {
     safeCancelRAF();
 
     if (videoRef.current) {
-      videoRef.current.pause();
-      videoRef.current.currentTime = 0;
+      try {
+        videoRef.current.pause();
+        videoRef.current.currentTime = 0;
+      } catch (_) {}
     }
 
     setIsPlaying(false);
@@ -178,7 +242,7 @@ const ShuntWSSAnalyzer = () => {
     [bullseyeRef, stackCanvasRef, stackCanvasLargeRef].forEach(ref => {
       if (ref.current) {
         const ctx = ref.current.getContext('2d');
-        ctx.clearRect(0, 0, ref.current.width, ref.current.height);
+        if (ctx) ctx.clearRect(0, 0, ref.current.width, ref.current.height);
       }
     });
 
@@ -216,7 +280,7 @@ const ShuntWSSAnalyzer = () => {
     const canvas = canvasRef.current;
     if (!video || !canvas) return;
 
-    const ctx = canvas.getContext('2d');
+    const ctx = get2dCtx(canvas);
     if (!ctx) return;
 
     if (video.videoWidth > 0 && (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight)) {
@@ -228,7 +292,9 @@ const ShuntWSSAnalyzer = () => {
     const h = canvas.height;
 
     if (!isPlaying) {
-      ctx.drawImage(video, 0, 0, w, h);
+      try {
+        ctx.drawImage(video, 0, 0, w, h);
+      } catch (_) {}
     }
 
     const drawROI = (roi, color, label) => {
@@ -405,7 +471,7 @@ const ShuntWSSAnalyzer = () => {
 
   const drawStack = useCallback((buffer, canvas, isLarge) => {
     if (!canvas) return;
-    const ctx = canvas.getContext('2d');
+    const ctx = get2dCtx(canvas);
     if (!ctx) return;
 
     const w = canvas.width, h = canvas.height;
@@ -587,7 +653,7 @@ const ShuntWSSAnalyzer = () => {
 
     if (video.paused || video.ended) return;
 
-    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const ctx = get2dCtx(canvas);
     if (!ctx) return;
 
     if (canvas.width !== video.videoWidth && video.videoWidth > 0) {
@@ -805,7 +871,7 @@ const ShuntWSSAnalyzer = () => {
 
     setCurrentFrameCount(frameCountRef.current);
     setRealtimeMetrics({ ...metricsRef.current });
-    // ✅ ここで一括更新。解析完了時に初めてグラフデータをStateに入れる。
+    // ✅ 完了時に一括更新のみ
     setTimeSeriesData([...timeSeriesRef.current]);
 
     drawBullseye(results);
@@ -815,9 +881,17 @@ const ShuntWSSAnalyzer = () => {
   const togglePlay = () => {
     if (!videoRef.current) return;
 
+    // ✅ 開始/停止のたびに必ず掃除（古いRAFやintervalが残るとDOM崩れの原因になりやすい）
+    safeCancelRAF();
+    if (uiTimerRef.current) {
+      clearInterval(uiTimerRef.current);
+      uiTimerRef.current = null;
+    }
+
     if (isPlaying) {
-      videoRef.current.pause();
-      safeCancelRAF();
+      try {
+        videoRef.current.pause();
+      } catch (_) {}
       setIsPlaying(false);
       setAnalysisStatus('停止中');
       return;
@@ -828,14 +902,18 @@ const ShuntWSSAnalyzer = () => {
     setAnalysisStatus('解析中');
     setIsPlaying(true);
 
-    safeCancelRAF();
-    videoRef.current.play().then(() => {
-      animationRef.current = requestAnimationFrame(processFrame);
-    }).catch((e) => {
-      console.error("video.play failed:", e);
-      setIsPlaying(false);
-      setAnalysisStatus('エラー');
-    });
+    videoRef.current.play()
+      .then(() => {
+        // mountedガード（StrictModeなどで一瞬unmount→thenが返ってきてもsetStateしない）
+        if (!mountedRef.current) return;
+        animationRef.current = requestAnimationFrame(processFrame);
+      })
+      .catch((e) => {
+        console.error("video.play failed:", e);
+        if (!mountedRef.current) return;
+        setIsPlaying(false);
+        setAnalysisStatus('エラー');
+      });
   };
 
   const handleVideoEnded = () => {
@@ -1235,24 +1313,17 @@ const ShuntWSSAnalyzer = () => {
 
             <div className="flex-1 min-h-0 min-w-0 relative">
               <div ref={graphBoxRef} className="w-full min-w-0" style={{ height: 280, minHeight: 260 }}>
-                {/* ✅ FIX 2: RechartsをDOMから絶対に消さない。条件付きレンダリングをやめ、CSSで表示/非表示を切り替える */}
-                {/* 解析中は、このコンテナの visibility を hidden にするが、DOMには残す */}
-                
-                {/* メッセージオーバーレイ */}
                 {isPlaying && (
                   <div className="absolute inset-0 z-10 flex items-center justify-center bg-slate-800/80 backdrop-blur-sm transition-opacity duration-300">
                     <span className="text-slate-400 text-xs animate-pulse">解析中…（グラフ描画を停止して安定化）</span>
                   </div>
                 )}
 
-                {/* グラフコンテナ (常にレンダリング) */}
-                <div 
+                <div
                   className="w-full h-full transition-opacity duration-300"
-                  style={{ 
+                  style={{
                     visibility: isPlaying ? 'hidden' : 'visible',
                     opacity: isPlaying ? 0 : 1,
-                    // isPlaying中は高さを0にしてレイアウトシフトを防ぎつつDOMを残すテクニックもあるが、
-                    // ここではabsoluteオーバーレイを使うので、グラフはそのまま背景に置いておくのが一番安全。
                   }}
                 >
                   {graphW > 0 ? (
@@ -1335,7 +1406,6 @@ const ShuntWSSAnalyzer = () => {
         </div>
       </div>
 
-      {/* 3D拡大モーダル */}
       {is3DModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/90 backdrop-blur-sm p-4 animate-in fade-in">
           <div
@@ -1454,7 +1524,6 @@ const ShuntWSSAnalyzer = () => {
         </div>
       )}
 
-      {/* Frame check modal */}
       {modalData && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
           <div className="bg-slate-800 rounded-xl border border-slate-700 p-1 max-w-4xl w-full">
