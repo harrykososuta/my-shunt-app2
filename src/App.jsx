@@ -1,24 +1,25 @@
 // src/App.jsx
-// ShuntFlow Analytics - v1.0.7
-// Changes:
-// 1) Move graphComment overlay -> BELOW chart
-// 2) Add stenosis logic (corr/lag/simultaneous peaks) + classification
-// 3) Add "parameter explanation" button -> popup modal
-// 4) Add alert pickup section (TAWSS/OSI/RRT/PressureProxy)
-// 5) Add "most dangerous frames (top ~3)" captured during analysis -> shown only when Check pressed
-// 6) Keep prior crash fixes (RAF/interval cleanup + mounted guards)
+// ShuntFlow Analytics - v2.0.5 (Fix: PDF Visibility Overlay Issue)
+//
+// Updates:
+// - Solved the "PDF see-through" issue by restructuring the DOM layers.
+// - The Main UI is now wrapped in a high z-index, opaque container that completely covers the PDF report layout underneath.
+// - Restored the original dark theme aesthetics of the main screen.
 
-import React, { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo } from 'react';
+import React, { useState, useRef, useEffect, useLayoutEffect, useCallback } from 'react';
 import {
   Upload, Play, Pause, RotateCcw, Activity, AlertCircle, FileVideo, Crosshair,
   Download, Settings, Ruler, Scan, Eye, Zap, Move3d, MousePointer2, TrendingUp,
-  Maximize2, X, Sliders, Eraser, Undo, ZoomIn, ZoomOut, RefreshCw, Move, Camera, Info
+  Maximize2, X, Sliders, Eraser, Undo, ZoomIn, ZoomOut, RefreshCw, Move, Camera, FileDown, Info
 } from 'lucide-react';
-import { ComposedChart, Line, Area, XAxis, YAxis, CartesianGrid, Tooltip, Legend } from 'recharts';
+import { ComposedChart, Line, Area, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 
 const ShuntWSSAnalyzer = () => {
   const [videoSrc, setVideoSrc] = useState(null);
   const [isPlaying, setIsPlaying] = useState(false);
+
+  // --- ライブラリ読み込み状態 ---
+  const [libsLoaded, setLibsLoaded] = useState(false);
 
   // --- 解析設定 ---
   const [config, setConfig] = useState({
@@ -57,22 +58,28 @@ const ShuntWSSAnalyzer = () => {
   const [sectorResults, setSectorResults] = useState([]);
   const [timeSeriesData, setTimeSeriesData] = useState([]);
   const [analysisStatus, setAnalysisStatus] = useState('待機中');
+
+  // Alerts list
   const [diagnosticText, setDiagnosticText] = useState([]);
+
+  // Comments / Summary
   const [bullseyeComment, setBullseyeComment] = useState('解析待機中...');
   const [graphComment, setGraphComment] = useState('');
+
   const [currentFrameCount, setCurrentFrameCount] = useState(0);
   const [realtimeMetrics, setRealtimeMetrics] = useState({ avg: 0, max: 0, area: 0, evaluation: '-' });
   const [modalData, setModalData] = useState(null);
   const [graphMode, setGraphMode] = useState('tawss_osi');
 
-  // --- 新規：狭窄判定 ---
+  // ---- Stenosis logic (WSS x PressureProxy) ----
   const [stenosisResult, setStenosisResult] = useState(null);
-  const [showParamExplain, setShowParamExplain] = useState(false);
+  const [isParamInfoOpen, setIsParamInfoOpen] = useState(false);
 
-  // --- 新規：アラート/危険フレーム ---
-  const [alertPickups, setAlertPickups] = useState([]);
-  const [dangerFrames, setDangerFrames] = useState([]); // [{frame, timeSec, score, img}]
-  const dangerFramesRef = useRef([]); // in-flight top3 during analysis
+  // ---- PDF Export State ----
+  const [isPdfConfirmOpen, setIsPdfConfirmOpen] = useState(false);
+  const [isPdfExporting, setIsPdfExporting] = useState(false);
+  // PDF作成用に一時的に画像を保持するState
+  const [pdfReportImages, setPdfReportImages] = useState({ bullseye: null, vessel: null });
 
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
@@ -82,6 +89,9 @@ const ShuntWSSAnalyzer = () => {
   const modalCanvasRef = useRef(null);
   const animationRef = useRef(null);
   const containerRef = useRef(null);
+  
+  // PDFレポート用の非表示コンテナRef
+  const reportContainerRef = useRef(null);
 
   // refs for heavy updates
   const frameCountRef = useRef(0);
@@ -89,7 +99,35 @@ const ShuntWSSAnalyzer = () => {
   const timeSeriesRef = useRef([]);
   const uiTimerRef = useRef(null);
 
-  // ✅ mounted guard（StrictModeなどで一瞬unmountされてもsetStateしない）
+  // Load external libraries (jsPDF, html-to-image) via script tags
+  useEffect(() => {
+    const loadScript = (src) => {
+      return new Promise((resolve, reject) => {
+        if (document.querySelector(`script[src="${src}"]`)) {
+          resolve();
+          return;
+        }
+        const script = document.createElement('script');
+        script.src = src;
+        script.onload = resolve;
+        script.onerror = reject;
+        document.head.appendChild(script);
+      });
+    };
+
+    Promise.all([
+      // jsPDF UMD
+      loadScript("https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"),
+      // html-to-image (exposed as window.htmlToImage)
+      loadScript("https://unpkg.com/html-to-image@1.11.11/dist/html-to-image.js")
+    ]).then(() => {
+      setLibsLoaded(true);
+      console.log("PDF libraries loaded.");
+    }).catch(err => {
+      console.error("Failed to load PDF libraries", err);
+    });
+  }, []);
+
   const mountedRef = useRef(true);
   useEffect(() => {
     mountedRef.current = true;
@@ -98,29 +136,23 @@ const ShuntWSSAnalyzer = () => {
     };
   }, []);
 
-  // ✅ グラフ幅
   const graphBoxRef = useRef(null);
   const [graphW, setGraphW] = useState(0);
 
   useLayoutEffect(() => {
     const el = graphBoxRef.current;
     if (!el) return;
-
     const measure = () => {
       const w = Math.floor(el.getBoundingClientRect().width);
       setGraphW(w > 10 ? w : 0);
     };
-
     measure();
-
     const ro = new ResizeObserver(() => {
       if (isPlaying) return;
       measure();
     });
-
     ro.observe(el);
     window.addEventListener('resize', measure);
-
     return () => {
       ro.disconnect();
       window.removeEventListener('resize', measure);
@@ -151,16 +183,13 @@ const ShuntWSSAnalyzer = () => {
     }
   };
 
-  // ✅ 追加：コンポーネントが外れる時に完全停止（insertBefore系クラッシュ予防）
   useEffect(() => {
     return () => {
       safeCancelRAF();
-
       if (uiTimerRef.current) {
         clearInterval(uiTimerRef.current);
         uiTimerRef.current = null;
       }
-
       if (videoRef.current) {
         try {
           videoRef.current.pause();
@@ -169,7 +198,6 @@ const ShuntWSSAnalyzer = () => {
     };
   }, []);
 
-  // ✅ FIX 1: 解析中は「重いグラフデータ(timeSeriesData)」をStateに入れない
   useEffect(() => {
     if (!isPlaying) {
       if (uiTimerRef.current) {
@@ -181,7 +209,6 @@ const ShuntWSSAnalyzer = () => {
 
     uiTimerRef.current = setInterval(() => {
       if (!mountedRef.current) return;
-
       setCurrentFrameCount(frameCountRef.current);
       setRealtimeMetrics({ ...metricsRef.current });
     }, 250);
@@ -194,208 +221,8 @@ const ShuntWSSAnalyzer = () => {
     };
   }, [isPlaying]);
 
-  // ---------------------------
-  // Utilities (JS版：狭窄ロジック)
-  // ---------------------------
-  const mean = (arr) => {
-    const v = arr.filter((x) => Number.isFinite(x));
-    if (!v.length) return 0;
-    return v.reduce((a, b) => a + b, 0) / v.length;
-  };
-
-  const std = (arr) => {
-    const v = arr.filter((x) => Number.isFinite(x));
-    if (v.length < 2) return 0;
-    const m = mean(v);
-    const s2 = v.reduce((acc, x) => acc + (x - m) * (x - m), 0) / (v.length - 1);
-    return Math.sqrt(s2);
-  };
-
-  const pearsonCorr = (a, b) => {
-    const n = Math.min(a.length, b.length);
-    const xa = [];
-    const xb = [];
-    for (let i = 0; i < n; i++) {
-      if (Number.isFinite(a[i]) && Number.isFinite(b[i])) {
-        xa.push(a[i]);
-        xb.push(b[i]);
-      }
-    }
-    if (xa.length < 3) return 0;
-    const ma = mean(xa);
-    const mb = mean(xb);
-    let num = 0;
-    let da = 0;
-    let db = 0;
-    for (let i = 0; i < xa.length; i++) {
-      const va = xa[i] - ma;
-      const vb = xb[i] - mb;
-      num += va * vb;
-      da += va * va;
-      db += vb * vb;
-    }
-    const den = Math.sqrt(da * db);
-    return den > 1e-9 ? num / den : 0;
-  };
-
-  // naive cross-correlation lag (full) -> returns lagIndex where b is "after" a if positive
-  const crossCorrelationLagIndex = (a, b) => {
-    const n = Math.min(a.length, b.length);
-    const xa = a.slice(0, n).map((x) => (Number.isFinite(x) ? x : 0));
-    const xb = b.slice(0, n).map((x) => (Number.isFinite(x) ? x : 0));
-    const ma = mean(xa);
-    const mb = mean(xb);
-    const aa = xa.map((x) => x - ma);
-    const bb = xb.map((x) => x - mb);
-
-    // lags from -(n-1) ... +(n-1)
-    let bestLag = 0;
-    let bestVal = -Infinity;
-
-    for (let lag = -(n - 1); lag <= (n - 1); lag++) {
-      let sum = 0;
-      for (let i = 0; i < n; i++) {
-        const j = i + lag;
-        if (j < 0 || j >= n) continue;
-        sum += aa[i] * bb[j];
-      }
-      if (sum > bestVal) {
-        bestVal = sum;
-        bestLag = lag;
-      }
-    }
-    return bestLag;
-  };
-
-  const detectLocalPeaksIdx = (arr) => {
-    const peaks = [];
-    for (let i = 1; i < arr.length - 1; i++) {
-      const x = arr[i];
-      if (!Number.isFinite(x)) continue;
-      const p = arr[i - 1];
-      const n = arr[i + 1];
-      if (Number.isFinite(p) && Number.isFinite(n) && x >= p && x >= n) peaks.push(i);
-    }
-    return peaks;
-  };
-
-  const computeTrendFeatures = (pressureProxyArr, wssArr, timeArr) => {
-    // align by finite values (simple mask)
-    const p = [];
-    const w = [];
-    const t = [];
-    const n = Math.min(pressureProxyArr.length, wssArr.length, timeArr.length);
-    for (let i = 0; i < n; i++) {
-      const pv = pressureProxyArr[i];
-      const wv = wssArr[i];
-      const tv = timeArr[i];
-      if (Number.isFinite(pv) && Number.isFinite(wv) && Number.isFinite(tv)) {
-        p.push(pv);
-        w.push(wv);
-        t.push(tv);
-      }
-    }
-    if (p.length < 3) {
-      return { corr: 0, lagSec: 0, simPeaks: 0 };
-    }
-    const corr = pearsonCorr(p, w);
-    let dt = 0;
-    if (t.length >= 2) {
-      const diffs = [];
-      for (let i = 1; i < t.length; i++) {
-        const d = t[i] - t[i - 1];
-        if (Number.isFinite(d) && d > 0) diffs.push(d);
-      }
-      diffs.sort((a, b) => a - b);
-      dt = diffs.length ? diffs[Math.floor(diffs.length / 2)] : 0;
-    }
-    if (!dt || dt <= 0) dt = 0.2; // fallback (sampling interval guess)
-
-    const lagIdx = crossCorrelationLagIndex(p, w);
-    const lagSec = lagIdx * dt;
-
-    const peaksW = detectLocalPeaksIdx(w);
-    const peaksP = detectLocalPeaksIdx(p);
-    const simPeaks = peaksW.reduce((acc, pw) => {
-      const hit = peaksP.some((pp) => Math.abs(pp - pw) <= 1);
-      return acc + (hit ? 1 : 0);
-    }, 0);
-
-    return { corr, lagSec, simPeaks };
-  };
-
-  const classifyStenosisJS = (feat, refStats = null) => {
-    const sim = feat.simPeaks ?? 0;
-    const lag = feat.lagSec ?? 0;
-    const corr = feat.corr ?? 0;
-
-    const corrScore = Math.abs(corr);
-    const lagScore = Math.abs(lag);
-
-    let mildScore = null;
-    if (refStats) {
-      const z = (x, m, s) => (s && s > 0 ? (x - m) / s : 0);
-      const zSim = z(sim, refStats.sim_peak_mean, refStats.sim_peak_std);
-      const zLag = z(lag, refStats.lag_mean, refStats.lag_std);
-      const zCorr = (corrScore - 0.3) / 0.2;
-      mildScore = zSim + zLag + zCorr * 0.5;
-    }
-
-    let category = "狭窄なし";
-    let rule = "";
-
-    if (sim >= 50 || lagScore >= 0.8 || corrScore >= 0.3) {
-      if (sim >= 70 || lagScore >= 1.5) {
-        category = "中等度狭窄疑い";
-        rule = `sim高め(${sim}) or lag大(${lag.toFixed(2)}s) → 中等度疑い`;
-      } else {
-        category = "軽度狭窄疑い";
-        rule = `sim=${sim}, lag=${lag.toFixed(2)}s, corr=${corr.toFixed(2)} で軽度疑い`;
-      }
-    }
-    if ((sim >= 80 && lagScore >= 2.0) || corrScore >= 0.75) {
-      category = "高度狭窄疑い";
-      rule = `強い異常性: sim=${sim}, lag=${lag.toFixed(2)}s, corr=${corr.toFixed(2)} → 高度疑い`;
-    }
-
-    if (mildScore !== null) {
-      if (category === "狭窄なし" && mildScore > 1.0) {
-        category = "軽度狭窄疑い（スコア補正）";
-        rule += `; mild_score=${mildScore.toFixed(2)} 補正`;
-      } else if (category.startsWith("軽度狭窄") && mildScore > 2.0) {
-        category = "中等度狭窄疑い（スコア補正）";
-        rule += `; mild_score=${mildScore.toFixed(2)} 補正`;
-      }
-    }
-
-    if (!rule) rule = `sim=${sim}, lag=${lag.toFixed(2)}s, corr=${corr.toFixed(2)} で初期分類`;
-
-    return {
-      category,
-      ruleUsed: rule,
-      mildSuspicionScore: mildScore
-    };
-  };
-
-  const refStats = useMemo(() => ({
-    sim_peak_mean: 50.0,
-    sim_peak_std: 15.0,
-    lag_mean: 1.5,
-    lag_std: 1.0,
-  }), []);
-
-  const stenosisIcon = (cat) => {
-    if (!cat) return "⚪️";
-    if (cat.startsWith("高度")) return "🔴";
-    if (cat.startsWith("中等度")) return "🟠";
-    if (cat.startsWith("軽度")) return "🟡";
-    if (cat.startsWith("狭窄なし")) return "🟢";
-    return "⚪️";
-  };
-
   const resetAnalysis = () => {
     safeCancelRAF();
-
     if (videoRef.current) {
       try {
         videoRef.current.pause();
@@ -419,13 +246,8 @@ const ShuntWSSAnalyzer = () => {
     setRot3D({ x: 0.5, y: 0.5 });
     setPan3D({ x: 0, y: 0 });
     setInteractionMode('rotate');
-
-    // new
     setStenosisResult(null);
-    setShowParamExplain(false);
-    setAlertPickups([]);
-    setDangerFrames([]);
-    dangerFramesRef.current = [];
+    setIsParamInfoOpen(false);
 
     frameCountRef.current = 0;
     metricsRef.current = { avg: 0, max: 0, area: 0, evaluation: '-' };
@@ -464,7 +286,7 @@ const ShuntWSSAnalyzer = () => {
   };
 
   const handleSave3DImage = () => {
-    const canvas = stackCanvasLargeRef.current;
+    const canvas = stackCanvasLargeRef.current || stackCanvasRef.current;
     if (!canvas) return;
     const image = canvas.toDataURL("image/png");
     const link = document.createElement("a");
@@ -844,21 +666,87 @@ const ShuntWSSAnalyzer = () => {
     drawStack(prev, stackCanvasLargeRef.current, true);
   };
 
-  const updateTopDangerFrames = (candidate) => {
-    // candidate: {frame, timeSec, score, img}
-    const cur = dangerFramesRef.current ? [...dangerFramesRef.current] : [];
-    cur.push(candidate);
-    cur.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
-    // dedupe by frame
-    const dedup = [];
-    const seen = new Set();
-    for (const c of cur) {
-      if (seen.has(c.frame)) continue;
-      seen.add(c.frame);
-      dedup.push(c);
-      if (dedup.length >= 3) break;
+  // ---------- stenosis feature functions ----------
+  const pearsonCorr = (a, b) => {
+    const n = Math.min(a.length, b.length);
+    if (n < 3) return NaN;
+    const ax = a.slice(0, n);
+    const bx = b.slice(0, n);
+    const meanA = ax.reduce((s, v) => s + v, 0) / n;
+    const meanB = bx.reduce((s, v) => s + v, 0) / n;
+    let num = 0, da = 0, db = 0;
+    for (let i = 0; i < n; i++) {
+      const x = ax[i] - meanA;
+      const y = bx[i] - meanB;
+      num += x * y;
+      da += x * x;
+      db += y * y;
     }
-    dangerFramesRef.current = dedup;
+    const den = Math.sqrt(da * db);
+    return den > 0 ? num / den : NaN;
+  };
+
+  const detectLocalPeaks = (arr) => {
+    const idx = [];
+    for (let i = 1; i < arr.length - 1; i++) {
+      const v = arr[i];
+      if (Number.isFinite(v) && v >= arr[i - 1] && v >= arr[i + 1]) idx.push(i);
+    }
+    return idx;
+  };
+
+  const crossCorrLag = (a, b, dtSec) => {
+    const n = Math.min(a.length, b.length);
+    if (n < 5) return { lagSec: NaN, lagIdx: 0 };
+    const ax = a.slice(0, n);
+    const bx = b.slice(0, n);
+    const meanA = ax.reduce((s, v) => s + v, 0) / n;
+    const meanB = bx.reduce((s, v) => s + v, 0) / n;
+    const a0 = ax.map(v => v - meanA);
+    const b0 = bx.map(v => v - meanB);
+
+    let best = -Infinity;
+    let bestLag = 0;
+    for (let lag = -(n - 1); lag <= (n - 1); lag++) {
+      let sum = 0;
+      for (let i = 0; i < n; i++) {
+        const j = i + lag;
+        if (j < 0 || j >= n) continue;
+        sum += a0[i] * b0[j];
+      }
+      if (sum > best) {
+        best = sum;
+        bestLag = lag;
+      }
+    }
+    return { lagSec: bestLag * dtSec, lagIdx: bestLag };
+  };
+
+  const classifyStenosisJS = (feat) => {
+    const sim = feat.simultaneousPeakCounts ?? 0;
+    const lagScore = Math.abs(feat.lagSec ?? 0);
+    const corrScore = Math.abs(feat.corr ?? 0);
+
+    let category = "狭窄なし";
+    let rule = "";
+
+    if (sim >= 10 || lagScore >= 0.8 || corrScore >= 0.3) {
+      if (sim >= 15 || lagScore >= 1.5) {
+        category = "中等度狭窄疑い";
+        rule = `sim高め(${sim}) or lag大(${(feat.lagSec ?? 0).toFixed(2)}s) → 中等度疑い`;
+      } else {
+        category = "軽度狭窄疑い";
+        rule = `sim=${sim}, lag=${(feat.lagSec ?? 0).toFixed(2)}s, corr=${(feat.corr ?? 0).toFixed(2)} で軽度疑い`;
+      }
+    }
+
+    if ((sim >= 20 && lagScore >= 2.0) || corrScore >= 0.75) {
+      category = "高度狭窄疑い";
+      rule = `強い異常性: sim=${sim}, lag=${(feat.lagSec ?? 0).toFixed(2)}s, corr=${(feat.corr ?? 0).toFixed(2)} → 高度疑い`;
+    }
+
+    if (!rule) rule = `sim=${sim}, lag=${(feat.lagSec ?? 0).toFixed(2)}s, corr=${(feat.corr ?? 0).toFixed(2)} で初期分類`;
+    return { category, rule };
   };
 
   const processFrame = useCallback(() => {
@@ -1039,7 +927,6 @@ const ShuntWSSAnalyzer = () => {
 
     const avg = frameStressPixels > 0 ? frameTotalStress / frameStressPixels : 0;
 
-    // sampling (timeSeries)
     if (frameCountRef.current % 6 === 0) {
       const evalLabel = avg > 80 ? 'HIGH' : avg > 40 ? 'WARN' : 'NORM';
       metricsRef.current = {
@@ -1049,117 +936,16 @@ const ShuntWSSAnalyzer = () => {
         evaluation: evalLabel
       };
 
-      const timeSec = Number.isFinite(video.currentTime) ? video.currentTime : (timeSeriesRef.current.length * 0.2);
-
-      // "pressure proxy": areaVal (same as before, but explicitly stored)
-      const pressureProxy = areaVal;
-
       const next = [...timeSeriesRef.current, {
         frame: frameCountRef.current,
-        timeSec: Number(timeSec.toFixed(3)),
         avgWss: Number(avg.toFixed(1)),
-        area: Number(areaVal.toFixed(3)),          // used by chart (existing)
-        pressureProxy: Number(pressureProxy.toFixed(3)), // new explicit field
+        area: Number(areaVal.toFixed(3)),
       }];
-      timeSeriesRef.current = next.length > 260 ? next.slice(-260) : next;
-
-      // update top danger frames (keep ~3)
-      // score: WSS (dominant) + pressureProxy (scaled)  ※簡易スコア
-      const pressureScale = (config.scalePxPerCm > 0) ? 40 : 0.8;
-      const score = (avg * 1.0) + (pressureProxy * pressureScale);
-
-      // capture occasionally to avoid heavy memory usage
-      // capture only if it's potentially high risk
-      const maybeHigh = avg > 55 || (pressureProxy > mean(timeSeriesRef.current.map(d => d.pressureProxy)) + std(timeSeriesRef.current.map(d => d.pressureProxy)));
-      if (maybeHigh) {
-        try {
-          const img = canvas.toDataURL('image/jpeg', 0.72);
-          updateTopDangerFrames({
-            frame: frameCountRef.current,
-            timeSec,
-            score,
-            img
-          });
-        } catch (_) {
-          // ignore capture errors
-        }
-      }
+      timeSeriesRef.current = next.length > 200 ? next.slice(-200) : next;
     }
 
     animationRef.current = requestAnimationFrame(processFrame);
   }, [config, drawStack, is3DModalOpen]);
-
-  const buildAlertPickups = (results, ts) => {
-    const pickups = [];
-
-    // 1) High TAWSS
-    const highT = results.filter(r => r.tawss > 80);
-    if (highT.length) {
-      const max = highT.reduce((p, c) => p.tawss > c.tawss ? p : c);
-      pickups.push({
-        type: 'warning',
-        title: 'TAWSS High',
-        desc: `${Math.round(max.angle)}°付近で高ストレス（TAWSS=${max.tawss.toFixed(1)}）`,
-        frameLabel: `F${max.maxFrame || '-'}`,
-      });
-    }
-
-    // 2) High OSI
-    const highO = results.filter(r => r.osi > 0.20);
-    if (highO.length) {
-      const max = highO.reduce((p, c) => p.osi > c.osi ? p : c);
-      pickups.push({
-        type: 'warning',
-        title: 'OSI High',
-        desc: `${Math.round(max.angle)}°付近でOSI高値（OSI=${max.osi.toFixed(3)}）`,
-        frameLabel: '-',
-      });
-    }
-
-    // 3) High RRT
-    const highR = results.filter(r => r.rrt > 0.5);
-    if (highR.length) {
-      const max = highR.reduce((p, c) => p.rrt > c.rrt ? p : c);
-      pickups.push({
-        type: 'danger',
-        title: 'RRT High',
-        desc: `${Math.round(max.angle)}°付近で滞留リスク（RRT=${max.rrt.toFixed(3)}）`,
-        frameLabel: '-',
-      });
-    }
-
-    // 4) Pressure proxy (area) anomaly / low compliance
-    if (ts.length >= 6) {
-      const p = ts.map(d => d.pressureProxy);
-      const minP = Math.min(...p);
-      const maxP = Math.max(...p);
-      const dist = minP > 0 ? (maxP - minP) / minP : 0;
-
-      const m = mean(p);
-      const s = std(p);
-      const spikes = ts.filter(d => d.pressureProxy > m + 1.5 * s);
-      if (spikes.length) {
-        const last = spikes[spikes.length - 1];
-        pickups.push({
-          type: 'warning',
-          title: 'PressureProxy Spike',
-          desc: `PressureProxy（面積）が上振れ（例: F${last.frame}, P=${last.pressureProxy.toFixed(3)}）`,
-          frameLabel: `F${last.frame}`,
-        });
-      }
-
-      if (dist < 0.1) {
-        pickups.push({
-          type: 'warning',
-          title: 'Low Compliance',
-          desc: `拍動変動が小さく、伸展性低下の可能性（ΔP/P≈${dist.toFixed(2)}）`,
-          frameLabel: '-',
-        });
-      }
-    }
-
-    return pickups.length ? pickups : [{ type: 'success', title: 'Normal', desc: 'アラート所見なし', frameLabel: '-' }];
-  };
 
   const finalizeAnalysis = () => {
     safeCancelRAF();
@@ -1190,27 +976,49 @@ const ShuntWSSAnalyzer = () => {
     setRealtimeMetrics({ ...metricsRef.current });
     setTimeSeriesData([...timeSeriesRef.current]);
 
-    // freeze danger frames captured
-    setDangerFrames([...dangerFramesRef.current]);
-
     drawBullseye(results);
 
-    // generate comments + existing diagnostics (kept) + new stenosis logic + new pickups
-    generateDiagnostics(results, timeSeriesRef.current);
-
-    const ts = timeSeriesRef.current;
-    if (ts.length >= 3) {
-      const wssArr = ts.map(d => d.avgWss);
-      const pArr = ts.map(d => d.pressureProxy);
-      const tArr = ts.map(d => d.timeSec);
-      const feat = computeTrendFeatures(pArr, wssArr, tArr);
-      const cls = classifyStenosisJS(feat, refStats);
-      setStenosisResult({ feat, cls });
-    } else {
-      setStenosisResult(null);
+    const ts = timeSeriesRef.current || [];
+    const wssArr = ts.map(d => d.avgWss);
+    const pArr = ts.map(d => d.area);
+    let dtSec = 0.2;
+    const v = videoRef.current;
+    if (v && Number.isFinite(v.duration) && v.duration > 0 && frameCountRef.current > 0 && ts.length > 1) {
+      const fpsApprox = frameCountRef.current / v.duration;
+      dtSec = 6 / fpsApprox;
+    } else if (ts.length > 1) {
+      const df = (ts[ts.length - 1].frame - ts[0].frame);
+      dtSec = df > 0 ? 1 / (df / (ts.length - 1)) : 0.2;
     }
 
-    setAlertPickups(buildAlertPickups(results, timeSeriesRef.current));
+    const corr = pearsonCorr(wssArr, pArr);
+    const { lagSec } = crossCorrLag(pArr, wssArr, dtSec);
+    const peaksW = detectLocalPeaks(wssArr);
+    const peaksP = detectLocalPeaks(pArr);
+    const sim = peaksW.reduce((count, pw) => {
+      const ok = peaksP.some(pp => Math.abs(pp - pw) <= 1);
+      return count + (ok ? 1 : 0);
+    }, 0);
+
+    const feat = {
+      corr,
+      lagSec,
+      simultaneousPeakCounts: sim,
+      nPoints: ts.length,
+      dtSec
+    };
+    const cls = classifyStenosisJS({
+      corr,
+      lagSec,
+      simultaneousPeakCounts: sim
+    });
+
+    setStenosisResult({
+      ...feat,
+      ...cls
+    });
+
+    generateDiagnostics(results, ts, { ...feat, ...cls });
   };
 
   const togglePlay = () => {
@@ -1253,8 +1061,19 @@ const ShuntWSSAnalyzer = () => {
     finalizeAnalysis();
   };
 
-  const generateDiagnostics = (results, ts) => {
+  const generateDiagnostics = (results, ts, stenosis) => {
     const list = [];
+
+    if (stenosis && stenosis.category) {
+      const type = stenosis.category.includes("高度") ? "danger" : stenosis.category.includes("中等度") ? "warning" : stenosis.category.includes("軽度") ? "warning" : "success";
+      list.push({
+        type,
+        title: `狭窄判定（WSS × PressureProxy）`,
+        desc: `${stenosis.category} / corr=${Number.isFinite(stenosis.corr) ? stenosis.corr.toFixed(2) : 'NaN'} / lag=${Number.isFinite(stenosis.lagSec) ? stenosis.lagSec.toFixed(2) : 'NaN'}s / sim=${stenosis.simultaneousPeakCounts ?? 0}`,
+        frameLabel: '-',
+        rawFrame: null
+      });
+    }
 
     const highWss = results.filter(r => r.tawss > 80);
     let bComment = "特記すべき高WSS領域なし";
@@ -1274,7 +1093,7 @@ const ShuntWSSAnalyzer = () => {
     const avgAll = results.reduce((sum, r) => sum + r.tawss, 0) / results.length;
     let gComment = avgAll > 60 ? "全体的にWSSが高い傾向。" : "平均的なWSSレベル。";
 
-    if (ts.length > 0) {
+    if (ts && ts.length > 0) {
       const areas = ts.map(d => d.area);
       const minA = Math.min(...areas);
       const maxA = Math.max(...areas);
@@ -1293,8 +1112,29 @@ const ShuntWSSAnalyzer = () => {
     const low = results.filter(r => r.rrt > 0.5);
     if (low.length) {
       const max = low.reduce((p, c) => p.rrt > c.rrt ? p : c);
-      list.push({ type: 'danger', title: 'Stagnation', desc: `${Math.round(max.angle)}°付近で滞留リスク`, frameLabel: '-', rawFrame: null });
+      list.push({ type: 'danger', title: 'Stagnation', desc: `${Math.round(max.angle)}°付近で滞留リスク (RRT↑)`, frameLabel: '-', rawFrame: null });
     }
+
+    const dangerFrames = results
+      .filter(r => r.maxFrame && r.maxFrame > 0)
+      .sort((a, b) => (b.maxWss ?? 0) - (a.maxWss ?? 0))
+      .map(r => r.maxFrame);
+
+    const uniq = [];
+    for (const f of dangerFrames) {
+      if (!uniq.includes(f)) uniq.push(f);
+      if (uniq.length >= 3) break;
+    }
+
+    uniq.forEach((f, idx) => {
+      list.push({
+        type: idx === 0 ? 'danger' : 'warning',
+        title: `Danger Frame #${idx + 1}`,
+        desc: `高WSSピーク候補フレーム`,
+        frameLabel: `F${f}`,
+        rawFrame: f
+      });
+    });
 
     setDiagnosticText(list.length ? list : [{ type: 'success', title: 'Normal', desc: '異常なし' }]);
   };
@@ -1377,7 +1217,7 @@ const ShuntWSSAnalyzer = () => {
   };
 
   const openFrameModal = (diag) => {
-    if (diag?.rawFrame && videoRef.current) {
+    if (diag.rawFrame && videoRef.current) {
       setModalData(diag);
       const dur = videoRef.current.duration;
       const total = frameCountRef.current;
@@ -1404,689 +1244,821 @@ const ShuntWSSAnalyzer = () => {
     }
   }, [modalData]);
 
-  const openDangerFramesModal = () => {
-    if (!dangerFrames.length) return;
-    setModalData({
-      type: 'dangerFrames',
-      title: '危険フレーム（上位3）',
-      frames: dangerFrames
-    });
+  // ---------- PDF Export (Updated Strategy: DOM-to-Image with Opaque White Background) ----------
+
+  // 1. Capture current canvases (Bullseye, Vessel) to Image URLs
+  const preparePdfImages = useCallback(() => {
+    let bData = null;
+    let vData = null;
+
+    if (bullseyeRef.current) {
+      bData = bullseyeRef.current.toDataURL("image/png");
+    }
+
+    // 3D Vessel capture
+    const srcCanvas = stackCanvasLargeRef.current || stackCanvasRef.current;
+    if (srcCanvas) {
+       vData = srcCanvas.toDataURL("image/png");
+    }
+    
+    setPdfReportImages({ bullseye: bData, vessel: vData });
+  }, []);
+
+  // 2. Main Build Function
+  const buildPdf = async () => {
+    if (!reportContainerRef.current) return;
+    
+    if (!window.jspdf || !window.htmlToImage) {
+      alert("PDF生成ライブラリの読み込みが完了していません。少し待ってから再試行してください。");
+      return;
+    }
+
+    setIsPdfExporting(true);
+
+    try {
+      // Small delay to ensure React has rendered the hidden report with the new images
+      await new Promise(r => setTimeout(r, 800));
+
+      // Capture the DOM element (A4 container) as a PNG with explicit WHITE background
+      const dataUrl = await window.htmlToImage.toPng(reportContainerRef.current, {
+        cacheBust: true,
+        pixelRatio: 2, // High quality
+        backgroundColor: '#ffffff', // Critical for opaque background
+        style: {
+          backgroundColor: '#ffffff' // Double safeguard
+        }
+      });
+
+      // Create PDF (A4 Portrait)
+      const { jsPDF } = window.jspdf;
+      const pdf = new jsPDF({ orientation: "portrait", unit: "pt", format: "a4" });
+      const pdfW = pdf.internal.pageSize.getWidth();
+      const pdfH = pdf.internal.pageSize.getHeight();
+
+      pdf.addImage(dataUrl, 'PNG', 0, 0, pdfW, pdfH);
+
+      const fname = `ShuntFlow_Report_${new Date().toISOString().slice(0, 19).replace(/[-:]/g, "")}.pdf`;
+      pdf.save(fname);
+
+    } catch (err) {
+      console.error("PDF Export failed", err);
+      alert("PDF作成に失敗しました: " + err.message);
+    } finally {
+      setIsPdfExporting(false);
+      setPdfReportImages({ bullseye: null, vessel: null });
+    }
   };
 
-  const stenosisSummaryText = useMemo(() => {
-    if (!stenosisResult?.cls) return "解析後に表示されます";
-    const { category } = stenosisResult.cls;
-    // 例に合わせて「中等度狭窄を示す」形式
-    if (category.startsWith("中等度")) return "中等度狭窄を示す";
-    if (category.startsWith("高度")) return "高度狭窄を示す";
-    if (category.startsWith("軽度")) return "軽度狭窄を示す";
-    if (category.startsWith("狭窄なし")) return "狭窄なしを示す";
-    return category;
-  }, [stenosisResult]);
+  const handlePdfExportClick = () => {
+    if (!sectorResults.length || analysisStatus !== '完了') return;
+    setIsPdfConfirmOpen(true);
+  };
 
-  const relationshipLine = useMemo(() => {
-    if (!stenosisResult?.feat) return "TAWSS×PressureProxy の関係: 解析待機中";
-    const { corr, lagSec, simPeaks } = stenosisResult.feat;
-    return `TAWSS×PressureProxy の関係: corr=${corr.toFixed(2)} / lag=${lagSec.toFixed(2)}s / sim=${simPeaks}`;
-  }, [stenosisResult]);
+  const handlePdfConfirmYes = () => {
+    setIsPdfConfirmOpen(false);
+    preparePdfImages(); 
+    buildPdf();
+  };
+
+  const handlePdfConfirmNo = () => {
+    setIsPdfConfirmOpen(false);
+  };
 
   return (
-    <div className="min-h-screen bg-slate-900 text-slate-100 font-sans p-6">
-      <header className="mb-6 flex flex-wrap items-center justify-between border-b border-slate-700 pb-4 gap-4">
-        <div className="flex items-center gap-3">
-          <Activity className="text-blue-400 w-8 h-8" />
-          <div>
-            <h1 className="text-2xl font-bold tracking-tight">ShuntFlow <span className="text-blue-400">Pro</span></h1>
-            <p className="text-xs text-slate-500">TAWSS / OSI / Compliance / 3D-Vessel</p>
-          </div>
+    <div className="relative w-full min-h-screen overflow-hidden bg-slate-900">
+      
+      {/* ========================================================================
+        HIDDEN REPORT CONTAINER (A4 Portrait Layout)
+        This is rendered on the BOTTOMMOST layer (z-index: -1).
+        It is completely covered by the Main UI layer (z-index: 10), so it's invisible to the user.
+        Styles: 794px width (approx A4 at 96dpi), WHITE bg, black text.
+        ========================================================================
+      */}
+      <div 
+        ref={reportContainerRef}
+        style={{ 
+          position: 'absolute', 
+          top: 0, 
+          left: 0, 
+          width: '794px', 
+          minHeight: '1123px', // A4 height
+          backgroundColor: '#ffffff', // Critical: White background
+          color: '#000000',           // Black text for readability
+          padding: '40px',
+          fontFamily: '"Noto Sans JP", sans-serif',
+          zIndex: 0, // Behind the main UI
+        }}
+      >
+        {/* 1. Title */}
+        <div className="border-b-2 border-slate-800 mb-6 pb-2">
+          <h1 className="text-3xl font-bold text-slate-900">ShuntFlow Analytics — Clinical Report</h1>
+          <p className="text-sm text-slate-500 mt-1">Generated: {new Date().toLocaleString()}</p>
         </div>
-        <div className="flex items-center gap-2">
-          <div className="flex items-center bg-slate-800 rounded-lg p-1 border border-slate-700 mr-2">
-            <button
-              onClick={() => setToolMode(toolMode === 'calibration' ? 'none' : 'calibration')}
-              className={`p-2 rounded hover:bg-slate-700 relative ${toolMode === 'calibration' ? 'bg-blue-600 text-white' : 'text-slate-400'}`}
-              title="キャリブレーション"
-            >
-              <Ruler className="w-5 h-5" />
-              {config.scalePxPerCm > 0 && <span className="absolute top-0 right-0 w-2 h-2 bg-green-500 rounded-full"></span>}
-            </button>
 
-            <button
-              onClick={() => setToolMode(toolMode === 'roi-flow' ? 'none' : 'roi-flow')}
-              className={`p-2 rounded hover:bg-slate-700 relative ${toolMode === 'roi-flow' ? 'bg-red-600 text-white' : 'text-slate-400'}`}
-              title="解析ROI (血流)"
-            >
-              <Zap className="w-5 h-5" />
-              {config.roiFlow && <span className="absolute top-0 right-0 w-2 h-2 bg-green-500 rounded-full"></span>}
-            </button>
-
-            <button
-              onClick={() => setToolMode(toolMode === 'roi-vessel' ? 'none' : 'roi-vessel')}
-              className={`p-2 rounded hover:bg-slate-700 relative ${toolMode === 'roi-vessel' ? 'bg-emerald-600 text-white' : 'text-slate-400'}`}
-              title="形状ROI (血管壁抽出)"
-            >
-              <Scan className="w-5 h-5" />
-              {config.roiVessel && <span className="absolute top-0 right-0 w-2 h-2 bg-green-500 rounded-full"></span>}
-            </button>
-
-            <button
-              onClick={() => setShowSettings(!showSettings)}
-              className={`p-2 rounded hover:bg-slate-700 ${showSettings ? 'bg-slate-600 text-white' : 'text-slate-400'}`}
-              title="設定"
-            >
-              <Settings className="w-5 h-5" />
-            </button>
-          </div>
-
-          <button
-            onClick={handleDownloadCSV}
-            disabled={!sectorResults.length}
-            className="p-2 bg-slate-800 hover:bg-slate-700 rounded-lg text-slate-400 hover:text-white disabled:opacity-30 border border-slate-700"
-            title="CSVダウンロード"
-          >
-            <Download className="w-5 h-5" />
-          </button>
-
-          <label className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-lg cursor-pointer text-sm font-medium transition-colors">
-            <Upload className="w-4 h-4" /> 動画読込
-            <input type="file" accept="video/*" onChange={handleFileUpload} className="hidden" />
-          </label>
-        </div>
-      </header>
-
-      {showSettings && (
-        <div className="mb-6 bg-slate-800 p-4 rounded-xl border border-slate-600 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 animate-in fade-in slide-in-from-top-2">
-          <div>
-            <label className="text-xs text-slate-400 block mb-2">Color Threshold (血流感度): {config.colorThreshold}</label>
-            <input
-              type="range" min="10" max="100"
-              value={config.colorThreshold}
-              onChange={(e) => setConfig({ ...config, colorThreshold: Number(e.target.value) })}
-              className="w-full accent-blue-500"
-            />
-          </div>
-          <div>
-            <label className="text-xs text-slate-400 block mb-2">Wall Threshold (壁輝度): {config.wallThreshold}</label>
-            <input
-              type="range" min="10" max="200"
-              value={config.wallThreshold}
-              onChange={(e) => setConfig({ ...config, wallThreshold: Number(e.target.value) })}
-              className="w-full accent-emerald-500"
-            />
-          </div>
-          <div>
-            <label className="text-xs text-slate-400 block mb-2">Stress Multiplier (WSS強調): {config.stressMultiplier}</label>
-            <input
-              type="range" min="0.5" max="5.0" step="0.1"
-              value={config.stressMultiplier}
-              onChange={(e) => setConfig({ ...config, stressMultiplier: Number(e.target.value) })}
-              className="w-full accent-orange-500"
-            />
-          </div>
-        </div>
-      )}
-
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-        <div className="lg:col-span-5 space-y-4">
-          <div
-            ref={containerRef}
-            className={`bg-black rounded-xl overflow-hidden shadow-2xl border border-slate-700 relative aspect-video flex items-center justify-center group ${toolMode === 'none' ? 'cursor-default' : 'cursor-crosshair'}`}
-            onMouseDown={handleMouseDown}
-            onMouseMove={handleMouseMove}
-            onMouseUp={handleMouseUp}
-          >
-            {!videoSrc ? (
-              <div className="text-center text-slate-500">
-                <FileVideo className="w-16 h-16 mx-auto mb-2 opacity-50" />
-                <p>動画を選択してください</p>
-              </div>
-            ) : (
-              <>
-                <video
-                  ref={videoRef}
-                  src={videoSrc}
-                  className="hidden"
-                  muted
-                  playsInline
-                  onEnded={handleVideoEnded}
-                  onLoadedData={handleVideoLoaded}
-                />
-                <canvas ref={canvasRef} className="w-full h-full object-contain pointer-events-none" />
-
-                {toolMode === 'calibration' && (
-                  <div className="absolute top-4 bg-blue-600/90 text-white px-3 py-1 rounded-full text-xs shadow-lg pointer-events-none">
-                    1cmの両端をクリック
-                  </div>
-                )}
-                {toolMode === 'roi-flow' && (
-                  <div className="absolute top-4 bg-red-600/90 text-white px-3 py-1 rounded-full text-xs shadow-lg pointer-events-none">
-                    血流解析範囲をドラッグ
-                  </div>
-                )}
-                {toolMode === 'roi-vessel' && (
-                  <div className="absolute top-4 bg-emerald-600/90 text-white px-3 py-1 rounded-full text-xs shadow-lg pointer-events-none">
-                    血管形状範囲をドラッグ (3D用)
-                  </div>
-                )}
-
-                <div className="absolute bottom-4 left-4 flex flex-col gap-2 pointer-events-none">
-                  <div className="bg-black/60 backdrop-blur-sm px-3 py-1 rounded border border-white/10 text-xs text-white flex items-center gap-2">
-                    <Crosshair className="w-3 h-3 text-yellow-400" /> {analysisStatus} F:{currentFrameCount}
-                  </div>
-                </div>
-              </>
-            )}
-          </div>
-
-          <div className="flex items-center gap-4 bg-slate-800 p-4 rounded-xl border border-slate-700">
-            <button
-              onClick={togglePlay}
-              disabled={!videoSrc}
-              className={`flex-1 py-3 rounded-lg flex items-center justify-center gap-2 transition-all font-bold ${
-                !videoSrc
-                  ? 'bg-slate-700 text-slate-500'
-                  : isPlaying
-                    ? 'bg-red-500 hover:bg-red-600 text-white'
-                    : analysisStatus === '完了'
-                      ? 'bg-green-600 hover:bg-green-500 text-white'
-                      : 'bg-blue-600 hover:bg-blue-500 text-white'
-              }`}
-            >
-              {(() => {
-                const Icon = isPlaying ? Pause : (analysisStatus === '完了' ? RotateCcw : Play);
-                const label = isPlaying ? '停止' : (analysisStatus === '完了' ? '再解析' : '解析開始');
-                const key = isPlaying ? 'pause' : (analysisStatus === '完了' ? 're' : 'play');
-                return (
-                  <span className="inline-flex items-center gap-2" key={key}>
-                    <Icon className="w-5 h-5" />
-                    {label}
-                  </span>
-                );
-              })()}
-            </button>
-          </div>
-
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div className="bg-slate-800 p-4 rounded-xl border border-slate-700 flex flex-col items-center relative min-h-[220px]">
-              <h3 className="text-slate-400 text-xs font-bold uppercase mb-2 w-full text-left">Bullseye Plot</h3>
-              <div className="flex w-full items-start gap-2">
-                <div className="relative w-32 h-32 flex-shrink-0">
-                  <canvas ref={bullseyeRef} width={200} height={200} className="w-full h-full object-contain" />
-                </div>
-                <div className="flex-1 text-[10px] text-slate-400 space-y-2">
-                  <div className="text-blue-300 font-bold border-b border-slate-700 pb-1 mb-1">
-                    {bullseyeComment}
-                  </div>
-                  <div className="flex items-center gap-1"><span className="w-2 h-2 rounded bg-red-500"></span> High WSS</div>
-                  <div className="flex items-center gap-1"><span className="w-2 h-2 rounded bg-green-500"></span> Low</div>
-                  <div className="flex items-center gap-1"><span className="w-2 h-2 rounded bg-black border border-slate-600"></span> High OSI</div>
-                  <div className="border-t border-slate-700 pt-1 mt-1">
-                    R: 0°, B: 90°, L: 180°, T: 270°
-                  </div>
-                </div>
-              </div>
+        {/* 2. Three Charts (Horizontal) */}
+        <div className="mb-6">
+          <h2 className="text-lg font-bold bg-slate-100 p-2 mb-4 border-l-4 border-blue-500 text-slate-900">Hemodynamic Metrics</h2>
+          <div className="flex justify-between h-48">
+            {/* Chart 1: TAWSS/OSI */}
+            <div className="w-[32%] h-full border border-slate-200 rounded p-1 bg-white">
+              <div className="text-xs text-center font-bold mb-1 text-slate-800">TAWSS & OSI</div>
+              <ResponsiveContainer width="100%" height="90%">
+                <ComposedChart data={sectorResults}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                  <XAxis dataKey="angle" stroke="#64748b" tick={{fontSize: 8}} interval={8} />
+                  <YAxis yAxisId="left" stroke="#3b82f6" tick={{fontSize: 8}} />
+                  <YAxis yAxisId="right" orientation="right" stroke="#f59e0b" tick={{fontSize: 8}} domain={[0, 0.5]} />
+                  <Area yAxisId="left" type="monotone" dataKey="tawss" stroke="#3b82f6" fill="rgba(59,130,246,0.2)" isAnimationActive={false} />
+                  <Line yAxisId="right" type="monotone" dataKey="osi" stroke="#f59e0b" strokeWidth={2} dot={false} isAnimationActive={false} />
+                </ComposedChart>
+              </ResponsiveContainer>
             </div>
 
-            <div className="bg-slate-800 p-4 rounded-xl border border-slate-700 flex flex-col items-center relative min-h-[220px]">
-              <h3 className="text-slate-400 text-xs font-bold uppercase mb-2 w-full text-left flex items-center justify-between">
-                <span className="flex items-center gap-2"><Move3d className="w-3 h-3" /> 3D Vessel</span>
-                <div className="flex items-center gap-2">
-                  <button
-                    onClick={() => setIs3DModalOpen(true)}
-                    className="p-1 hover:bg-slate-700 rounded text-slate-400 hover:text-white"
-                    title="拡大表示"
-                  >
-                    <Maximize2 className="w-3 h-3" />
-                  </button>
-                  <span className="text-[9px] text-slate-500 flex items-center gap-1"><MousePointer2 className="w-3 h-3" /> Drag</span>
-                </div>
-              </h3>
+             {/* Chart 2: WSS/Area */}
+             <div className="w-[32%] h-full border border-slate-200 rounded p-1 bg-white">
+              <div className="text-xs text-center font-bold mb-1 text-slate-800">AvgWSS & Area</div>
+              <ResponsiveContainer width="100%" height="90%">
+                <ComposedChart data={timeSeriesData}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                  <XAxis dataKey="frame" stroke="#64748b" tick={{fontSize: 8}} interval={20} />
+                  <YAxis yAxisId="left" stroke="#3b82f6" tick={{fontSize: 8}} />
+                  <YAxis yAxisId="right" orientation="right" stroke="#10b981" tick={{fontSize: 8}} />
+                  <Line yAxisId="left" type="monotone" dataKey="avgWss" stroke="#3b82f6" strokeWidth={2} dot={false} isAnimationActive={false} />
+                  <Area yAxisId="right" type="monotone" dataKey="area" stroke="#10b981" fill="rgba(16,185,129,0.2)" isAnimationActive={false} />
+                </ComposedChart>
+              </ResponsiveContainer>
+            </div>
 
-              <div
-                className="relative w-full h-32 bg-slate-900 rounded border border-slate-700 overflow-hidden cursor-move"
-                onMouseDown={handle3DMouseDown}
-                onMouseMove={handle3DMouseMove}
-                onMouseUp={handle3DMouseUp}
-                onMouseLeave={handle3DMouseUp}
+            {/* Chart 3: RRT */}
+            <div className="w-[32%] h-full border border-slate-200 rounded p-1 bg-white">
+              <div className="text-xs text-center font-bold mb-1 text-slate-800">RRT (Stagnation)</div>
+              <ResponsiveContainer width="100%" height="90%">
+                <ComposedChart data={sectorResults}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                  <XAxis dataKey="angle" stroke="#64748b" tick={{fontSize: 8}} interval={8} />
+                  <YAxis stroke="#ef4444" tick={{fontSize: 8}} />
+                  <Area type="monotone" dataKey="rrt" stroke="#ef4444" fill="rgba(239,68,68,0.2)" isAnimationActive={false} />
+                </ComposedChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
+        </div>
+
+        {/* 3. Summary / Diagnostics */}
+        <div className="mb-6">
+          <h2 className="text-lg font-bold bg-slate-100 p-2 mb-2 border-l-4 border-blue-500 text-slate-900">Diagnostic Summary</h2>
+          {/* Stenosis Result */}
+          <div className="mb-2 p-2 border border-slate-300 rounded bg-slate-50">
+             <div className="font-bold text-sm text-slate-900">判定: {stenosisResult?.category || '-'}</div>
+             <div className="text-xs text-slate-600 mt-1">
+               Corr: {stenosisResult?.corr?.toFixed(2) ?? '-'}, Lag: {stenosisResult?.lagSec?.toFixed(2) ?? '-'}s, SimPeaks: {stenosisResult?.simultaneousPeakCounts ?? 0}
+             </div>
+          </div>
+          {/* Alerts List */}
+          <div className="space-y-1">
+            {diagnosticText.slice(0, 5).map((d, i) => (
+              <div key={i} className="flex items-center gap-2 text-sm border-b border-slate-100 pb-1">
+                <span className={`w-2 h-2 rounded-full ${d.type === 'danger' ? 'bg-red-500' : d.type === 'warning' ? 'bg-yellow-500' : 'bg-green-500'}`}></span>
+                <span className="font-bold text-slate-800">{d.title}:</span>
+                <span className="text-slate-700">{d.desc}</span>
+              </div>
+            ))}
+          </div>
+          {/* Comments */}
+          <div className="mt-2 text-sm text-slate-600">
+             <p><strong>Bullseye:</strong> {bullseyeComment}</p>
+             <p><strong>Overall:</strong> {graphComment}</p>
+          </div>
+        </div>
+
+        {/* 4. Bullseye Image */}
+        <div className="mb-6 flex items-start gap-6">
+          <div className="w-1/3">
+             <h2 className="text-lg font-bold bg-slate-100 p-2 mb-2 border-l-4 border-blue-500 text-slate-900">WSS Distribution</h2>
+             {pdfReportImages.bullseye && (
+               <div className="border border-slate-200 p-2 flex justify-center bg-white">
+                 <img src={pdfReportImages.bullseye} alt="Bullseye" className="w-40 h-40 object-contain" />
+               </div>
+             )}
+          </div>
+          
+          {/* 5. Vessel Path (Final Image) */}
+          <div className="w-2/3">
+             <h2 className="text-lg font-bold bg-slate-100 p-2 mb-2 border-l-4 border-blue-500 text-slate-900">Vessel Geometry (3D)</h2>
+             {pdfReportImages.vessel && (
+               <div className="border border-slate-200 p-2 bg-black flex justify-center">
+                 <img src={pdfReportImages.vessel} alt="Vessel" className="h-40 object-contain" />
+               </div>
+             )}
+          </div>
+        </div>
+
+        {/* 6. Footer (Parameter Explanations) */}
+        <div className="mt-auto pt-4 border-t-2 border-slate-300">
+          <h3 className="font-bold text-sm mb-2 text-slate-800">Parameter Explanations</h3>
+          <div className="grid grid-cols-2 gap-4 text-xs text-slate-600">
+             <div>
+               <p className="mb-1"><strong>TAWSS (Time-Averaged Wall Shear Stress):</strong> Average shear stress over the cardiac cycle. High values (&gt;80) indicate potential wall damage.</p>
+               <p className="mb-1"><strong>OSI (Oscillatory Shear Index):</strong> Measures the directionality of flow. 0.5 indicates purely oscillatory flow (high risk).</p>
+             </div>
+             <div>
+               <p className="mb-1"><strong>RRT (Relative Residence Time):</strong> Indicates how long particles stay near the wall. High RRT suggests flow stagnation/thrombus risk.</p>
+               <p className="mb-1"><strong>Corr & Lag:</strong> Correlation between WSS and Vessel Area (Pressure proxy). High lag or low correlation suggests stenosis or wall stiffening.</p>
+             </div>
+          </div>
+          {stenosisResult?.rule && (
+             <div className="mt-2 text-xs text-slate-500 italic">判定ルール: {stenosisResult.rule}</div>
+          )}
+        </div>
+      </div>
+      {/* End of Hidden Report */}
+
+
+      {/* MAIN UI LAYER - Opaque Background to Cover PDF */}
+      <div className="relative z-10 w-full min-h-screen bg-slate-900 text-slate-100 p-6">
+        <header className="mb-6 flex flex-wrap items-center justify-between border-b border-slate-700 pb-4 gap-4">
+          <div className="flex items-center gap-3">
+            <Activity className="text-blue-400 w-8 h-8" />
+            <div>
+              <h1 className="text-2xl font-bold tracking-tight">ShuntFlow <span className="text-blue-400">Pro</span></h1>
+              <p className="text-xs text-slate-500">TAWSS / OSI / Compliance / 3D-Vessel</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <div className="flex items-center bg-slate-800 rounded-lg p-1 border border-slate-700 mr-2">
+              <button
+                onClick={() => setToolMode(toolMode === 'calibration' ? 'none' : 'calibration')}
+                className={`p-2 rounded hover:bg-slate-700 relative ${toolMode === 'calibration' ? 'bg-blue-600 text-white' : 'text-slate-400'}`}
+                title="キャリブレーション"
               >
-                <canvas ref={stackCanvasRef} width={300} height={200} className="w-full h-full object-contain" />
-              </div>
+                <Ruler className="w-5 h-5" />
+                {config.scalePxPerCm > 0 && <span className="absolute top-0 right-0 w-2 h-2 bg-green-500 rounded-full"></span>}
+              </button>
 
-              <div className="w-full mt-2 flex items-center gap-2">
-                <Sliders className="w-3 h-3 text-slate-500" />
-                <span className="text-[9px] text-slate-500">Filter:</span>
-                <input
-                  type="range" min="0" max="3" step="1"
-                  value={noiseFilterLevel}
-                  onChange={(e) => setNoiseFilterLevel(Number(e.target.value))}
-                  className="w-16 h-1 bg-slate-700 rounded-lg appearance-none cursor-pointer"
-                />
-                <span className="text-[9px] text-slate-400">{['Off', 'Low', 'Med', 'High'][noiseFilterLevel]}</span>
-              </div>
+              <button
+                onClick={() => setToolMode(toolMode === 'roi-flow' ? 'none' : 'roi-flow')}
+                className={`p-2 rounded hover:bg-slate-700 relative ${toolMode === 'roi-flow' ? 'bg-red-600 text-white' : 'text-slate-400'}`}
+                title="解析ROI (血流)"
+              >
+                <Zap className="w-5 h-5" />
+                {config.roiFlow && <span className="absolute top-0 right-0 w-2 h-2 bg-green-500 rounded-full"></span>}
+              </button>
+
+              <button
+                onClick={() => setToolMode(toolMode === 'roi-vessel' ? 'none' : 'roi-vessel')}
+                className={`p-2 rounded hover:bg-slate-700 relative ${toolMode === 'roi-vessel' ? 'bg-emerald-600 text-white' : 'text-slate-400'}`}
+                title="形状ROI (血管壁抽出)"
+              >
+                <Scan className="w-5 h-5" />
+                {config.roiVessel && <span className="absolute top-0 right-0 w-2 h-2 bg-green-500 rounded-full"></span>}
+              </button>
+
+              <button
+                onClick={() => setShowSettings(!showSettings)}
+                className={`p-2 rounded hover:bg-slate-700 ${showSettings ? 'bg-slate-600 text-white' : 'text-slate-400'}`}
+                title="設定"
+              >
+                <Settings className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* CSV button */}
+            <button
+              onClick={handleDownloadCSV}
+              disabled={!sectorResults.length}
+              className="p-2 bg-slate-800 hover:bg-slate-700 rounded-lg text-slate-400 hover:text-white disabled:opacity-30 border border-slate-700"
+              title="CSVダウンロード"
+            >
+              <Download className="w-5 h-5" />
+            </button>
+
+            {/* PDF button (Trigger Modal) */}
+            <button
+              onClick={handlePdfExportClick}
+              disabled={!sectorResults.length || analysisStatus !== '完了' || isPdfExporting || !libsLoaded}
+              className="p-2 bg-slate-800 hover:bg-slate-700 rounded-lg text-slate-400 hover:text-white disabled:opacity-30 border border-slate-700"
+              title="PDFレポート出力"
+            >
+              <FileDown className="w-5 h-5" />
+            </button>
+
+            <label className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-lg cursor-pointer text-sm font-medium transition-colors">
+              <Upload className="w-4 h-4" /> 動画読込
+              <input type="file" accept="video/*" onChange={handleFileUpload} className="hidden" />
+            </label>
+          </div>
+        </header>
+
+        {showSettings && (
+          <div className="mb-6 bg-slate-800 p-4 rounded-xl border border-slate-600 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 animate-in fade-in slide-in-from-top-2 relative z-10">
+            <div>
+              <label className="text-xs text-slate-400 block mb-2">Color Threshold (血流感度): {config.colorThreshold}</label>
+              <input
+                type="range" min="10" max="100"
+                value={config.colorThreshold}
+                onChange={(e) => setConfig({ ...config, colorThreshold: Number(e.target.value) })}
+                className="w-full accent-blue-500"
+              />
+            </div>
+            <div>
+              <label className="text-xs text-slate-400 block mb-2">Wall Threshold (壁輝度): {config.wallThreshold}</label>
+              <input
+                type="range" min="10" max="200"
+                value={config.wallThreshold}
+                onChange={(e) => setConfig({ ...config, wallThreshold: Number(e.target.value) })}
+                className="w-full accent-emerald-500"
+              />
+            </div>
+            <div>
+              <label className="text-xs text-slate-400 block mb-2">Stress Multiplier (WSS強調): {config.stressMultiplier}</label>
+              <input
+                type="range" min="0.5" max="5.0" step="0.1"
+                value={config.stressMultiplier}
+                onChange={(e) => setConfig({ ...config, stressMultiplier: Number(e.target.value) })}
+                className="w-full accent-orange-500"
+              />
             </div>
           </div>
-        </div>
+        )}
 
-        <div className="lg:col-span-7 space-y-6">
-          <div className="bg-slate-800 p-6 rounded-xl border border-slate-700 flex flex-col">
-            <div className="flex justify-between items-center mb-4">
-              <h3 className="text-slate-400 text-sm font-medium flex items-center gap-2">
-                <Activity className="w-4 h-4" /> Analytic Graphs
-              </h3>
-              <div className="flex bg-slate-900 rounded-lg p-1 gap-1">
-                <button onClick={() => setGraphMode('tawss_osi')} className={`px-3 py-1 text-xs rounded transition-colors ${graphMode === 'tawss_osi' ? 'bg-slate-700 text-white font-bold' : 'text-slate-500 hover:text-slate-300'}`}>TAWSS & OSI</button>
-                <button onClick={() => setGraphMode('wss_pressure')} className={`px-3 py-1 text-xs rounded transition-colors ${graphMode === 'wss_pressure' ? 'bg-slate-700 text-white font-bold' : 'text-slate-500 hover:text-slate-300'}`}>WSS & Area</button>
-                <button onClick={() => setGraphMode('rrt')} className={`px-3 py-1 text-xs rounded transition-colors ${graphMode === 'rrt' ? 'bg-slate-700 text-white font-bold' : 'text-slate-500 hover:text-slate-300'}`}>RRT</button>
-              </div>
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 relative z-10">
+          <div className="lg:col-span-5 space-y-4">
+            <div
+              ref={containerRef}
+              className={`bg-black rounded-xl overflow-hidden shadow-2xl border border-slate-700 relative aspect-video flex items-center justify-center group ${toolMode === 'none' ? 'cursor-default' : 'cursor-crosshair'}`}
+              onMouseDown={handleMouseDown}
+              onMouseMove={handleMouseMove}
+              onMouseUp={handleMouseUp}
+            >
+              {!videoSrc ? (
+                <div className="text-center text-slate-500">
+                  <FileVideo className="w-16 h-16 mx-auto mb-2 opacity-50" />
+                  <p>動画を選択してください</p>
+                </div>
+              ) : (
+                <>
+                  <video
+                    ref={videoRef}
+                    src={videoSrc}
+                    className="hidden"
+                    muted
+                    playsInline
+                    onEnded={handleVideoEnded}
+                    onLoadedData={handleVideoLoaded}
+                  />
+                  <canvas ref={canvasRef} className="w-full h-full object-contain pointer-events-none" />
+
+                  {toolMode === 'calibration' && (
+                    <div className="absolute top-4 bg-blue-600/90 text-white px-3 py-1 rounded-full text-xs shadow-lg pointer-events-none">
+                      1cmの両端をクリック
+                    </div>
+                  )}
+                  {toolMode === 'roi-flow' && (
+                    <div className="absolute top-4 bg-red-600/90 text-white px-3 py-1 rounded-full text-xs shadow-lg pointer-events-none">
+                      血流解析範囲をドラッグ
+                    </div>
+                  )}
+                  {toolMode === 'roi-vessel' && (
+                    <div className="absolute top-4 bg-emerald-600/90 text-white px-3 py-1 rounded-full text-xs shadow-lg pointer-events-none">
+                      血管形状範囲をドラッグ (3D用)
+                    </div>
+                  )}
+
+                  <div className="absolute bottom-4 left-4 flex flex-col gap-2 pointer-events-none">
+                    <div className="bg-black/60 backdrop-blur-sm px-3 py-1 rounded border border-white/10 text-xs text-white flex items-center gap-2">
+                      <Crosshair className="w-3 h-3 text-yellow-400" /> {analysisStatus} F:{currentFrameCount}
+                    </div>
+                  </div>
+                </>
+              )}
             </div>
 
-            {/* 1. TAWSSとOSIの関係の表示（チャート） */}
-            <div className="flex-1 min-h-0 min-w-0 relative">
-              <div ref={graphBoxRef} className="w-full min-w-0 relative" style={{ height: 280, minHeight: 260 }}>
-                {isPlaying && (
-                  <div className="absolute inset-0 z-10 flex items-center justify-center bg-slate-800/80 backdrop-blur-sm transition-opacity duration-300">
-                    <span className="text-slate-400 text-xs animate-pulse">解析中…（グラフ描画を停止して安定化）</span>
+            <div className="flex items-center gap-4 bg-slate-800 p-4 rounded-xl border border-slate-700">
+              <button
+                onClick={togglePlay}
+                disabled={!videoSrc}
+                className={`flex-1 py-3 rounded-lg flex items-center justify-center gap-2 transition-all font-bold ${
+                  !videoSrc
+                    ? 'bg-slate-700 text-slate-500'
+                    : isPlaying
+                      ? 'bg-red-500 hover:bg-red-600 text-white'
+                      : analysisStatus === '完了'
+                        ? 'bg-green-600 hover:bg-green-500 text-white'
+                        : 'bg-blue-600 hover:bg-blue-500 text-white'
+                }`}
+              >
+                {(() => {
+                  const Icon = isPlaying ? Pause : (analysisStatus === '完了' ? RotateCcw : Play);
+                  const label = isPlaying ? '停止' : (analysisStatus === '完了' ? '再解析' : '解析開始');
+                  const key = isPlaying ? 'pause' : (analysisStatus === '完了' ? 're' : 'play');
+                  return (
+                    <span className="inline-flex items-center gap-2" key={key}>
+                      <Icon className="w-5 h-5" />
+                      {label}
+                    </span>
+                  );
+                })()}
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="bg-slate-800 p-4 rounded-xl border border-slate-700 flex flex-col items-center relative min-h-[220px]">
+                <h3 className="text-slate-400 text-xs font-bold uppercase mb-2 w-full text-left">Bullseye Plot</h3>
+                <div className="flex w-full items-start gap-2">
+                  <div className="relative w-32 h-32 flex-shrink-0">
+                    <canvas ref={bullseyeRef} width={200} height={200} className="w-full h-full object-contain" />
                   </div>
-                )}
+                  <div className="flex-1 text-[10px] text-slate-400 space-y-2">
+                    <div className="text-blue-300 font-bold border-b border-slate-700 pb-1 mb-1">
+                      {bullseyeComment}
+                    </div>
+                    <div className="flex items-center gap-1"><span className="w-2 h-2 rounded bg-red-500"></span> High WSS</div>
+                    <div className="flex items-center gap-1"><span className="w-2 h-2 rounded bg-green-500"></span> Low</div>
+                    <div className="flex items-center gap-1"><span className="w-2 h-2 rounded bg-black border border-slate-600"></span> High OSI</div>
+                    <div className="border-t border-slate-700 pt-1 mt-1">
+                      R: 0°, B: 90°, L: 180°, T: 270°
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="bg-slate-800 p-4 rounded-xl border border-slate-700 flex flex-col items-center relative min-h-[220px]">
+                <h3 className="text-slate-400 text-xs font-bold uppercase mb-2 w-full text-left flex items-center justify-between">
+                  <span className="flex items-center gap-2"><Move3d className="w-3 h-3" /> 3D Vessel</span>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => setIs3DModalOpen(true)}
+                      className="p-1 hover:bg-slate-700 rounded text-slate-400 hover:text-white"
+                      title="拡大表示"
+                    >
+                      <Maximize2 className="w-3 h-3" />
+                    </button>
+                    <span className="text-[9px] text-slate-500 flex items-center gap-1"><MousePointer2 className="w-3 h-3" /> Drag</span>
+                  </div>
+                </h3>
 
                 <div
-                  className="w-full h-full transition-opacity duration-300"
-                  style={{
-                    visibility: isPlaying ? 'hidden' : 'visible',
-                    opacity: isPlaying ? 0 : 1,
-                  }}
+                  className="relative w-full h-32 bg-slate-900 rounded border border-slate-700 overflow-hidden cursor-move"
+                  onMouseDown={handle3DMouseDown}
+                  onMouseMove={handle3DMouseMove}
+                  onMouseUp={handle3DMouseUp}
+                  onMouseLeave={handle3DMouseUp}
                 >
-                  {graphW > 0 ? (
-                    <div className="w-full h-full">
-                      {graphMode === 'wss_pressure' ? (
-                        <ComposedChart width={graphW} height={280} data={timeSeriesData}>
-                          <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-                          <XAxis dataKey="frame" stroke="#64748b" tick={{ fontSize: 10 }} label={{ value: 'Frame', position: 'insideBottom', offset: -5, fontSize: 10 }} />
-                          <YAxis yAxisId="left" stroke="#3b82f6" label={{ value: 'Avg WSS', angle: -90, position: 'insideLeft', fontSize: 10, fill: '#3b82f6' }} tick={{ fontSize: 10 }} />
-                          <YAxis yAxisId="right" orientation="right" stroke="#10b981" label={{ value: `Area (${config.scalePxPerCm > 0 ? 'cm²' : 'px²'})`, angle: 90, position: 'insideRight', fontSize: 10, fill: '#10b981' }} tick={{ fontSize: 10 }} domain={['auto', 'auto']} />
-                          <Tooltip contentStyle={{ backgroundColor: '#1e293b', borderColor: '#334155' }} />
-                          <Legend verticalAlign="top" height={36} />
-                          <Line yAxisId="left" type="monotone" dataKey="avgWss" stroke="#3b82f6" strokeWidth={2} name="Avg WSS" dot={false} isAnimationActive={false} />
-                          <Area yAxisId="right" type="monotone" dataKey="area" stroke="#10b981" fill="rgba(16,185,129,0.2)" name="Vessel Area (Pressure Proxy)" isAnimationActive={false} />
-                        </ComposedChart>
-                      ) : graphMode === 'rrt' ? (
-                        <ComposedChart width={graphW} height={280} data={sectorResults}>
-                          <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-                          <XAxis dataKey="angle" stroke="#64748b" tick={{ fontSize: 10 }} label={{ value: 'Angle', position: 'insideBottom', offset: -5, fontSize: 10 }} />
-                          <YAxis stroke="#ef4444" label={{ value: 'RRT', angle: -90, position: 'insideLeft', fontSize: 10, fill: '#ef4444' }} tick={{ fontSize: 10 }} />
-                          <Tooltip contentStyle={{ backgroundColor: '#1e293b', borderColor: '#334155' }} />
-                          <Legend verticalAlign="top" height={36} />
-                          <Area type="monotone" dataKey="rrt" stroke="#ef4444" fill="rgba(239,68,68,0.2)" name="Relative Residence Time" isAnimationActive={false} />
-                        </ComposedChart>
-                      ) : (
-                        <ComposedChart width={graphW} height={280} data={sectorResults}>
-                          <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-                          <XAxis dataKey="angle" stroke="#64748b" tick={{ fontSize: 10 }} label={{ value: 'Angle', position: 'insideBottom', offset: -5, fontSize: 10 }} />
-                          <YAxis yAxisId="left" stroke="#3b82f6" label={{ value: 'TAWSS', angle: -90, position: 'insideLeft', fontSize: 10, fill: '#3b82f6' }} tick={{ fontSize: 10 }} />
-                          <YAxis yAxisId="right" orientation="right" stroke="#f59e0b" label={{ value: 'OSI', angle: 90, position: 'insideRight', fontSize: 10, fill: '#f59e0b' }} tick={{ fontSize: 10 }} domain={[0, 0.5]} />
-                          <Tooltip contentStyle={{ backgroundColor: '#1e293b', borderColor: '#334155' }} />
-                          <Legend verticalAlign="top" height={36} />
-                          <Area yAxisId="left" type="monotone" dataKey="tawss" stroke="#3b82f6" fill="rgba(59,130,246,0.2)" name="TAWSS" isAnimationActive={false} />
-                          <Line yAxisId="right" type="monotone" dataKey="osi" stroke="#f59e0b" strokeWidth={2} dot={false} name="OSI" isAnimationActive={false} />
-                        </ComposedChart>
-                      )}
-                    </div>
-                  ) : (
-                    <div className="w-full h-full flex items-center justify-center text-slate-500 text-xs">
-                      Chart preparing...
-                    </div>
-                  )}
+                  <canvas ref={stackCanvasRef} width={300} height={200} className="w-full h-full object-contain" />
+                </div>
+
+                <div className="w-full mt-2 flex items-center gap-2">
+                  <Sliders className="w-3 h-3 text-slate-500" />
+                  <span className="text-[9px] text-slate-500">Filter:</span>
+                  <input
+                    type="range" min="0" max="3" step="1"
+                    value={noiseFilterLevel}
+                    onChange={(e) => setNoiseFilterLevel(Number(e.target.value))}
+                    className="w-16 h-1 bg-slate-700 rounded-lg appearance-none cursor-pointer"
+                  />
+                  <span className="text-[9px] text-slate-400">{['Off', 'Low', 'Med', 'High'][noiseFilterLevel]}</span>
                 </div>
               </div>
             </div>
+          </div>
 
-            {/* ここから：指定の順序でチャートの「下」に配置 */}
-            <div className="mt-4 space-y-3">
-
-              {/* 1.（補助）TAWSSとOSIの関係の表示（テキスト） */}
-              <div className="bg-slate-900/60 border border-slate-700 rounded-lg px-4 py-3 text-xs text-slate-300 flex items-start gap-2">
-                <TrendingUp className="w-4 h-4 text-blue-400 mt-0.5 flex-shrink-0" />
-                <div className="space-y-1">
-                  <div className="font-bold text-slate-200">① TAWSS と OSI の関係</div>
-                  <div className="text-slate-300">{relationshipLine}</div>
-                  {graphComment && !isPlaying && (
-                    <div className="text-slate-400">補足: {graphComment}</div>
-                  )}
+          <div className="lg:col-span-7 space-y-6">
+            <div className="bg-slate-800 p-6 rounded-xl border border-slate-700 flex flex-col">
+              <div className="flex justify-between items-center mb-4">
+                <h3 className="text-slate-400 text-sm font-medium flex items-center gap-2">
+                  <Activity className="w-4 h-4" /> Analytic Graphs
+                </h3>
+                <div className="flex bg-slate-900 rounded-lg p-1 gap-1">
+                  <button onClick={() => setGraphMode('tawss_osi')} className={`px-3 py-1 text-xs rounded transition-colors ${graphMode === 'tawss_osi' ? 'bg-slate-700 text-white font-bold' : 'text-slate-500 hover:text-slate-300'}`}>TAWSS & OSI</button>
+                  <button onClick={() => setGraphMode('wss_pressure')} className={`px-3 py-1 text-xs rounded transition-colors ${graphMode === 'wss_pressure' ? 'bg-slate-700 text-white font-bold' : 'text-slate-500 hover:text-slate-300'}`}>WSS & Area</button>
+                  <button onClick={() => setGraphMode('rrt')} className={`px-3 py-1 text-xs rounded transition-colors ${graphMode === 'rrt' ? 'bg-slate-700 text-white font-bold' : 'text-slate-500 hover:text-slate-300'}`}>RRT</button>
                 </div>
               </div>
 
-              {/* 2. 判定comment */}
-              <div className="bg-slate-900/60 border border-slate-700 rounded-lg px-4 py-3 flex items-center justify-between gap-3">
-                <div className="flex items-center gap-3">
-                  <div className="text-2xl">{stenosisIcon(stenosisResult?.cls?.category)}</div>
-                  <div className="flex flex-col">
-                    <div className="text-slate-400 text-[11px] font-bold">② 判定 comment</div>
-                    <div className="text-slate-100 font-bold text-sm">
-                      {stenosisResult?.cls?.category ? stenosisSummaryText : "解析後に表示されます"}
+              <div className="flex-1 min-h-0 min-w-0 relative">
+                <div ref={graphBoxRef} className="w-full min-w-0 relative" style={{ height: 280, minHeight: 260 }}>
+                  {isPlaying && (
+                    <div className="absolute inset-0 z-10 flex items-center justify-center bg-slate-800/80 backdrop-blur-sm transition-opacity duration-300">
+                      <span className="text-slate-400 text-xs animate-pulse">解析中…（グラフ描画を停止して安定化）</span>
                     </div>
-                    {stenosisResult?.cls?.category && (
-                      <div className="text-[11px] text-slate-400">
-                        {stenosisResult?.cls?.ruleUsed}
+                  )}
+
+                  <div
+                    className="w-full h-full transition-opacity duration-300"
+                    style={{
+                      visibility: isPlaying ? 'hidden' : 'visible',
+                      opacity: isPlaying ? 0 : 1,
+                    }}
+                  >
+                    {graphW > 0 ? (
+                      <div className="w-full h-full">
+                        {graphMode === 'wss_pressure' ? (
+                          <ComposedChart width={graphW} height={280} data={timeSeriesData}>
+                            <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
+                            <XAxis dataKey="frame" stroke="#64748b" tick={{ fontSize: 10 }} label={{ value: 'Frame', position: 'insideBottom', offset: -5, fontSize: 10 }} />
+                            <YAxis yAxisId="left" stroke="#3b82f6" label={{ value: 'Avg WSS', angle: -90, position: 'insideLeft', fontSize: 10, fill: '#3b82f6' }} tick={{ fontSize: 10 }} />
+                            <YAxis yAxisId="right" orientation="right" stroke="#10b981" label={{ value: `Area (${config.scalePxPerCm > 0 ? 'cm²' : 'px²'})`, angle: 90, position: 'insideRight', fontSize: 10, fill: '#10b981' }} tick={{ fontSize: 10 }} domain={['auto', 'auto']} />
+                            <Tooltip contentStyle={{ backgroundColor: '#1e293b', borderColor: '#334155' }} />
+                            <Legend verticalAlign="top" height={36} />
+                            <Line yAxisId="left" type="monotone" dataKey="avgWss" stroke="#3b82f6" strokeWidth={2} name="Avg WSS" dot={false} isAnimationActive={false} />
+                            <Area yAxisId="right" type="monotone" dataKey="area" stroke="#10b981" fill="rgba(16,185,129,0.2)" name="Vessel Area (Pressure Proxy)" isAnimationActive={false} />
+                          </ComposedChart>
+                        ) : graphMode === 'rrt' ? (
+                          <ComposedChart width={graphW} height={280} data={sectorResults}>
+                            <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
+                            <XAxis dataKey="angle" stroke="#64748b" tick={{ fontSize: 10 }} label={{ value: 'Angle', position: 'insideBottom', offset: -5, fontSize: 10 }} />
+                            <YAxis stroke="#ef4444" label={{ value: 'RRT', angle: -90, position: 'insideLeft', fontSize: 10, fill: '#ef4444' }} tick={{ fontSize: 10 }} />
+                            <Tooltip contentStyle={{ backgroundColor: '#1e293b', borderColor: '#334155' }} />
+                            <Legend verticalAlign="top" height={36} />
+                            <Area type="monotone" dataKey="rrt" stroke="#ef4444" fill="rgba(239,68,68,0.2)" name="Relative Residence Time" isAnimationActive={false} />
+                          </ComposedChart>
+                        ) : (
+                          <ComposedChart width={graphW} height={280} data={sectorResults}>
+                            <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
+                            <XAxis dataKey="angle" stroke="#64748b" tick={{ fontSize: 10 }} label={{ value: 'Angle', position: 'insideBottom', offset: -5, fontSize: 10 }} />
+                            <YAxis yAxisId="left" stroke="#3b82f6" label={{ value: 'TAWSS', angle: -90, position: 'insideLeft', fontSize: 10, fill: '#3b82f6' }} tick={{ fontSize: 10 }} />
+                            <YAxis yAxisId="right" orientation="right" stroke="#f59e0b" label={{ value: 'OSI', angle: 90, position: 'insideRight', fontSize: 10, fill: '#f59e0b' }} tick={{ fontSize: 10 }} domain={[0, 0.5]} />
+                            <Tooltip contentStyle={{ backgroundColor: '#1e293b', borderColor: '#334155' }} />
+                            <Legend verticalAlign="top" height={36} />
+                            <Area yAxisId="left" type="monotone" dataKey="tawss" stroke="#3b82f6" fill="rgba(59,130,246,0.2)" name="TAWSS" isAnimationActive={false} />
+                            <Line yAxisId="right" type="monotone" dataKey="osi" stroke="#f59e0b" strokeWidth={2} dot={false} name="OSI" isAnimationActive={false} />
+                          </ComposedChart>
+                        )}
+                      </div>
+                    ) : (
+                      <div className="w-full h-full flex items-center justify-center text-slate-500 text-xs">
+                        Chart preparing...
                       </div>
                     )}
                   </div>
                 </div>
-              </div>
 
-              {/* 3. パラメータ数値の説明ボタン（押すとポップアップ） */}
-              <div className="flex items-center justify-between bg-slate-900/60 border border-slate-700 rounded-lg px-4 py-3">
-                <div className="text-xs text-slate-400">
-                  ③ 判定に使用したパラメータ（corr / lag / sim）の説明
-                </div>
-                <button
-                  onClick={() => setShowParamExplain(true)}
-                  disabled={!stenosisResult?.feat}
-                  className="px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-white text-xs disabled:opacity-30 disabled:hover:bg-slate-700 flex items-center gap-2"
-                >
-                  <Info className="w-4 h-4" />
-                  説明を表示
-                </button>
-              </div>
+                {!isPlaying && graphComment && (
+                  <div className="mt-3 bg-black/30 text-slate-200 text-xs px-3 py-2 rounded flex items-start gap-2 backdrop-blur-sm border border-slate-700/50">
+                    <TrendingUp className="w-4 h-4 text-blue-400 mt-0.5 flex-shrink-0" />
+                    <span>{graphComment}</span>
+                  </div>
+                )}
 
-              {/* 4. アラート値ピックアップ */}
-              <div className="bg-slate-900/60 border border-slate-700 rounded-lg px-4 py-3">
-                <div className="text-slate-200 font-bold text-xs mb-2">④ アラート値ピックアップ（TAWSS / OSI / RRT / PressureProxy）</div>
-                <div className="grid grid-cols-1 gap-3">
-                  {alertPickups.map((a, i) => (
+                {!isPlaying && (
+                  <div className="mt-3 bg-slate-900/40 border border-slate-700 rounded-lg p-3">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="text-sm font-bold text-slate-100">
+                        {stenosisResult?.category ? `判定：${stenosisResult.category}` : "判定：-"}
+                      </div>
+                      <button
+                        onClick={() => setIsParamInfoOpen(true)}
+                        disabled={!stenosisResult}
+                        className="px-3 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded text-white disabled:opacity-30 inline-flex items-center gap-1"
+                        title="パラメータ数値の説明"
+                      >
+                        <Info className="w-3 h-3" />
+                        数値の説明
+                      </button>
+                    </div>
+                    {stenosisResult?.rule && (
+                      <div className="text-xs text-slate-400 mt-1">
+                        {stenosisResult.rule}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                <div className="grid grid-cols-1 gap-3 mt-4">
+                  {diagnosticText.map((d, i) => (
                     <div
                       key={i}
                       className={`p-3 rounded border flex items-center gap-3 ${
-                        a.type === 'danger'
+                        d.type === 'danger'
                           ? 'bg-red-900/20 border-red-800'
-                          : a.type === 'warning'
+                          : d.type === 'warning'
                             ? 'bg-yellow-900/20 border-yellow-800'
                             : 'bg-green-900/20 border-green-800'
                       }`}
                     >
-                      <AlertCircle className={`w-5 h-5 ${a.type === 'danger' ? 'text-red-500' : a.type === 'warning' ? 'text-yellow-500' : 'text-green-500'}`} />
+                      <AlertCircle className={`w-5 h-5 ${d.type === 'danger' ? 'text-red-500' : d.type === 'warning' ? 'text-yellow-500' : 'text-green-500'}`} />
                       <div className="flex-1">
-                        <div className="font-bold text-sm text-slate-200">{a.title}</div>
-                        <div className="text-xs text-slate-400">{a.desc}</div>
+                        <div className="font-bold text-sm text-slate-200">{d.title}</div>
+                        <div className="text-xs text-slate-400">{d.desc}</div>
                       </div>
-                      <div className="text-[11px] text-slate-400 font-mono">{a.frameLabel}</div>
+                      {d.rawFrame && (
+                        <button onClick={() => openFrameModal(d)} className="px-3 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded text-white">
+                          <Eye className="w-3 h-3 inline mr-1" />Check
+                        </button>
+                      )}
                     </div>
                   ))}
                 </div>
               </div>
-
-              {/* 5. 最も危険なframeをピックアップ（3枚）→ Checkで表示 */}
-              <div className="bg-slate-900/60 border border-slate-700 rounded-lg px-4 py-3 flex items-center justify-between gap-3">
-                <div>
-                  <div className="text-slate-200 font-bold text-xs">⑤ 最も危険なフレーム（上位3）</div>
-                  <div className="text-[11px] text-slate-400">
-                    解析中に自動キャプチャした危険度上位フレームを表示します（Checkで展開）。
-                  </div>
-                </div>
-                <button
-                  onClick={openDangerFramesModal}
-                  disabled={!dangerFrames.length}
-                  className="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-white text-xs disabled:opacity-30 disabled:hover:bg-slate-700 flex items-center gap-2"
-                >
-                  <Eye className="w-4 h-4" />
-                  Check
-                </button>
-              </div>
             </div>
+          </div>
+        </div>
 
-            {/* 既存の診断カード（残す：補助情報として） */}
-            <div className="grid grid-cols-1 gap-3 mt-6">
-              {diagnosticText.map((d, i) => (
-                <div
-                  key={i}
-                  className={`p-3 rounded border flex items-center gap-3 ${
-                    d.type === 'danger'
-                      ? 'bg-red-900/20 border-red-800'
-                      : d.type === 'warning'
-                        ? 'bg-yellow-900/20 border-yellow-800'
-                        : 'bg-green-900/20 border-green-800'
+        {is3DModalOpen && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/90 backdrop-blur-sm p-4 animate-in fade-in">
+            <div
+              ref={modalContainerRef}
+              className="w-full h-full max-w-6xl max-h-[90vh] bg-slate-900 rounded-xl border border-slate-700 flex flex-col relative overflow-hidden"
+            >
+              <div className="absolute top-4 left-4 z-10 flex flex-col gap-2">
+                <button
+                  onClick={() => setInteractionMode('delete')}
+                  className={`flex items-center gap-2 px-3 py-2 rounded-lg transition-colors border ${
+                    interactionMode === 'delete'
+                      ? 'bg-red-600/90 border-red-500 text-white shadow-lg shadow-red-900/20'
+                      : 'bg-slate-800/80 border-slate-600 text-slate-300 hover:bg-slate-700'
                   }`}
                 >
-                  <AlertCircle className={`w-5 h-5 ${d.type === 'danger' ? 'text-red-500' : d.type === 'warning' ? 'text-yellow-500' : 'text-green-500'}`} />
-                  <div className="flex-1">
-                    <div className="font-bold text-sm text-slate-200">{d.title}</div>
-                    <div className="text-xs text-slate-400">{d.desc}</div>
-                  </div>
-                  {d.rawFrame && (
-                    <button onClick={() => openFrameModal(d)} className="px-3 py-1 text-xs bg-slate-700 hover:bg-slate-600 rounded text-white">
-                      <Eye className="w-3 h-3 inline mr-1" />Check
-                    </button>
-                  )}
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
-      </div>
-
-      {is3DModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/90 backdrop-blur-sm p-4 animate-in fade-in">
-          <div
-            ref={modalContainerRef}
-            className="w-full h-full max-w-6xl max-h-[90vh] bg-slate-900 rounded-xl border border-slate-700 flex flex-col relative overflow-hidden"
-          >
-            <div className="absolute top-4 left-4 z-10 flex flex-col gap-2">
-              <button
-                onClick={() => setInteractionMode('delete')}
-                className={`flex items-center gap-2 px-3 py-2 rounded-lg transition-colors border ${
-                  interactionMode === 'delete'
-                    ? 'bg-red-600/90 border-red-500 text-white shadow-lg shadow-red-900/20'
-                    : 'bg-slate-800/80 border-slate-600 text-slate-300 hover:bg-slate-700'
-                }`}
-              >
-                <Eraser className="w-4 h-4" />
-                <span className="text-sm font-medium">修正 (削除)</span>
-              </button>
-
-              <button
-                onClick={() => setInteractionMode('move')}
-                className={`flex items-center gap-2 px-3 py-2 rounded-lg transition-colors border ${
-                  interactionMode === 'move'
-                    ? 'bg-emerald-600/90 border-emerald-500 text-white shadow-lg shadow-emerald-900/20'
-                    : 'bg-slate-800/80 border-slate-600 text-slate-300 hover:bg-slate-700'
-                }`}
-              >
-                <Move className="w-4 h-4" />
-                <span className="text-sm font-medium">移動 (パン)</span>
-              </button>
-
-              <button
-                onClick={() => setInteractionMode('rotate')}
-                className={`flex items-center gap-2 px-3 py-2 rounded-lg transition-colors border ${
-                  interactionMode === 'rotate'
-                    ? 'bg-blue-600/90 border-blue-500 text-white shadow-lg shadow-blue-900/20'
-                    : 'bg-slate-800/80 border-slate-600 text-slate-300 hover:bg-slate-700'
-                }`}
-              >
-                <Move3d className="w-4 h-4" />
-                <span className="text-sm font-medium">回転 (視点)</span>
-              </button>
-
-              {historyStack.length > 0 && (
-                <button
-                  onClick={handleUndo}
-                  className="flex items-center gap-2 px-3 py-2 rounded-lg bg-slate-800/80 border border-slate-600 text-slate-300 hover:bg-slate-700 transition-colors mt-2"
-                >
-                  <Undo className="w-4 h-4" />
-                  <span className="text-sm">元に戻す</span>
+                  <Eraser className="w-4 h-4" />
+                  <span className="text-sm font-medium">修正 (削除)</span>
                 </button>
-              )}
-            </div>
 
-            <button
-              onClick={handleSave3DImage}
-              className="absolute top-4 right-16 p-2 bg-slate-800/80 rounded-full hover:bg-slate-700 text-white z-10 border border-slate-600 flex items-center gap-2 px-4"
-              title="3Dモデルを画像として保存"
-            >
-              <Camera className="w-5 h-5" />
-              <span className="text-sm font-medium">保存</span>
-            </button>
-
-            <button
-              onClick={() => setIs3DModalOpen(false)}
-              className="absolute top-4 right-4 p-2 bg-slate-800/80 rounded-full hover:bg-slate-700 text-white z-10 border border-slate-600"
-            >
-              <X className="w-6 h-6" />
-            </button>
-
-            <div
-              className={`flex-1 w-full h-full ${
-                interactionMode === 'delete' ? 'cursor-crosshair' : interactionMode === 'move' ? 'cursor-move' : 'cursor-grab'
-              }`}
-              onMouseDown={handle3DMouseDown}
-              onMouseMove={handle3DMouseMove}
-              onMouseUp={handle3DMouseUp}
-              onMouseLeave={handle3DMouseUp}
-              onWheel={handleWheel}
-            >
-              <canvas
-                ref={stackCanvasLargeRef}
-                width={modalSize.w}
-                height={modalSize.h}
-                className="block"
-              />
-            </div>
-
-            <div className="absolute bottom-6 right-6 flex flex-col gap-2 z-10 items-end">
-              <div className="flex items-center gap-2 bg-slate-800/90 p-2 rounded-lg border border-slate-600 backdrop-blur-sm shadow-xl">
-                <button onClick={() => setZoomLevel(z => Math.min(z * 1.2, 5))} className="p-1.5 hover:bg-slate-700 rounded text-slate-300"><ZoomIn className="w-4 h-4" /></button>
-                <span className="text-xs text-slate-400 font-mono w-10 text-center">{Math.round(zoomLevel * 100)}%</span>
-                <button onClick={() => setZoomLevel(z => Math.max(z / 1.2, 0.2))} className="p-1.5 hover:bg-slate-700 rounded text-slate-300"><ZoomOut className="w-4 h-4" /></button>
-                <div className="w-px h-4 bg-slate-600 mx-1"></div>
                 <button
-                  onClick={() => { setZoomLevel(1); setRot3D({ x: 0.5, y: 0.5 }); setPan3D({ x: 0, y: 0 }); }}
-                  className="p-1.5 hover:bg-slate-700 rounded text-slate-300"
-                  title="Reset View"
+                  onClick={() => setInteractionMode('move')}
+                  className={`flex items-center gap-2 px-3 py-2 rounded-lg transition-colors border ${
+                    interactionMode === 'move'
+                      ? 'bg-emerald-600/90 border-emerald-500 text-white shadow-lg shadow-emerald-900/20'
+                      : 'bg-slate-800/80 border-slate-600 text-slate-300 hover:bg-slate-700'
+                  }`}
                 >
-                  <RefreshCw className="w-4 h-4" />
+                  <Move className="w-4 h-4" />
+                  <span className="text-sm font-medium">移動 (パン)</span>
                 </button>
-              </div>
 
-              <div className="flex items-center gap-3 bg-slate-800/90 px-4 py-2 rounded-lg border border-slate-600 backdrop-blur-sm shadow-xl">
-                <span className="text-xs font-bold text-slate-300">Filter</span>
-                <input
-                  type="range" min="0" max="3" step="1"
-                  value={noiseFilterLevel}
-                  onChange={(e) => setNoiseFilterLevel(Number(e.target.value))}
-                  className="w-20 h-1.5 bg-slate-600 rounded-lg appearance-none cursor-pointer accent-blue-500"
-                />
-                <span className="text-xs font-mono text-blue-300 w-8 text-center">{['Off', 'Low', 'Med', 'Hi'][noiseFilterLevel]}</span>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
+                <button
+                  onClick={() => setInteractionMode('rotate')}
+                  className={`flex items-center gap-2 px-3 py-2 rounded-lg transition-colors border ${
+                    interactionMode === 'rotate'
+                      ? 'bg-blue-600/90 border-blue-500 text-white shadow-lg shadow-blue-900/20'
+                      : 'bg-slate-800/80 border-slate-600 text-slate-300 hover:bg-slate-700'
+                  }`}
+                >
+                  <Move3d className="w-4 h-4" />
+                  <span className="text-sm font-medium">回転 (視点)</span>
+                </button>
 
-      {/* 既存：単一フレームのモーダル */}
-      {modalData && modalData.type !== 'dangerFrames' && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
-          <div className="bg-slate-800 rounded-xl border border-slate-700 p-1 max-w-4xl w-full">
-            <div className="flex justify-between items-center p-3 border-b border-slate-700 mb-2">
-              <span className="font-bold">{modalData.title}</span>
-              <button onClick={() => setModalData(null)}><X className="w-5 h-5" /></button>
-            </div>
-            <div className="aspect-video bg-black flex justify-center">
-              <canvas ref={modalCanvasRef} className="h-full object-contain" />
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* 新規：危険フレーム（上位3）のモーダル（Checkで開く） */}
-      {modalData && modalData.type === 'dangerFrames' && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
-          <div className="bg-slate-800 rounded-xl border border-slate-700 p-4 max-w-5xl w-full">
-            <div className="flex justify-between items-center pb-3 border-b border-slate-700 mb-4">
-              <span className="font-bold">{modalData.title}</span>
-              <button onClick={() => setModalData(null)} className="p-2 hover:bg-slate-700 rounded"><X className="w-5 h-5" /></button>
-            </div>
-
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-              {modalData.frames.map((f, idx) => (
-                <div key={idx} className="bg-slate-900 rounded-lg border border-slate-700 overflow-hidden">
-                  <div className="px-3 py-2 text-xs text-slate-300 flex items-center justify-between border-b border-slate-700">
-                    <span className="font-mono">F{f.frame}</span>
-                    <span className="text-slate-400">{Number(f.timeSec).toFixed(2)}s</span>
-                  </div>
-                  <div className="aspect-video bg-black flex items-center justify-center">
-                    <img src={f.img} alt={`frame-${f.frame}`} className="w-full h-full object-contain" />
-                  </div>
-                  <div className="px-3 py-2 text-[11px] text-slate-400 border-t border-slate-700">
-                    score: {Number(f.score).toFixed(1)}
-                  </div>
-                </div>
-              ))}
-            </div>
-
-            <div className="mt-4 text-[11px] text-slate-400">
-              ※危険度スコアは「AvgWSS＋PressureProxy（面積）を係数で補正」した簡易指標です。運用に合わせて係数調整できます。
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* 新規：パラメータ説明ポップアップ（3のボタン） */}
-      {showParamExplain && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
-          <div className="bg-slate-800 rounded-xl border border-slate-700 p-4 max-w-2xl w-full">
-            <div className="flex justify-between items-center pb-3 border-b border-slate-700 mb-4">
-              <div className="font-bold flex items-center gap-2">
-                <Info className="w-5 h-5 text-blue-400" />
-                判定パラメータの説明
-              </div>
-              <button onClick={() => setShowParamExplain(false)} className="p-2 hover:bg-slate-700 rounded">
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-
-            <div className="space-y-3 text-sm text-slate-200">
-              <div className="bg-slate-900/60 border border-slate-700 rounded-lg p-3">
-                <div className="text-xs text-slate-400 font-bold mb-1">使用パラメータ（今回の値）</div>
-                <div className="text-xs text-slate-300 font-mono">
-                  {stenosisResult?.feat
-                    ? `corr=${stenosisResult.feat.corr.toFixed(2)} / lag=${stenosisResult.feat.lagSec.toFixed(2)}s / sim=${stenosisResult.feat.simPeaks}`
-                    : "解析待機中"}
-                </div>
-                {stenosisResult?.cls?.mildSuspicionScore !== null && stenosisResult?.cls?.mildSuspicionScore !== undefined && (
-                  <div className="text-xs text-slate-400 mt-1">
-                    mild_score（補正用）: {Number(stenosisResult.cls.mildSuspicionScore).toFixed(2)}
-                  </div>
+                {historyStack.length > 0 && (
+                  <button
+                    onClick={handleUndo}
+                    className="flex items-center gap-2 px-3 py-2 rounded-lg bg-slate-800/80 border border-slate-600 text-slate-300 hover:bg-slate-700 transition-colors mt-2"
+                  >
+                    <Undo className="w-4 h-4" />
+                    <span className="text-sm">元に戻す</span>
+                  </button>
                 )}
               </div>
 
-              <div className="space-y-2 text-xs text-slate-300 leading-relaxed">
-                <div>
-                  <span className="font-bold text-slate-100">corr（相関）</span>：
-                  TAWSS と PressureProxy（面積）の「連動の強さ」。±1に近いほど連動が強く、流体力学的に同時変動が目立つ状態を示します。
+              <button
+                onClick={handleSave3DImage}
+                className="absolute top-4 right-16 p-2 bg-slate-800/80 rounded-full hover:bg-slate-700 text-white z-10 border border-slate-600 flex items-center gap-2 px-4"
+                title="3Dモデルを画像として保存"
+              >
+                <Camera className="w-5 h-5" />
+                <span className="text-sm font-medium">保存</span>
+              </button>
+
+              <button
+                onClick={() => setIs3DModalOpen(false)}
+                className="absolute top-4 right-4 p-2 bg-slate-800/80 rounded-full hover:bg-slate-700 text-white z-10 border border-slate-600"
+              >
+                <X className="w-6 h-6" />
+              </button>
+
+              <div
+                className={`flex-1 w-full h-full ${
+                  interactionMode === 'delete' ? 'cursor-crosshair' : interactionMode === 'move' ? 'cursor-move' : 'cursor-grab'
+                }`}
+                onMouseDown={handle3DMouseDown}
+                onMouseMove={handle3DMouseMove}
+                onMouseUp={handle3DMouseUp}
+                onMouseLeave={handle3DMouseUp}
+                onWheel={handleWheel}
+              >
+                <canvas
+                  ref={stackCanvasLargeRef}
+                  width={modalSize.w}
+                  height={modalSize.h}
+                  className="block"
+                />
+              </div>
+
+              <div className="absolute bottom-6 right-6 flex flex-col gap-2 z-10 items-end">
+                <div className="flex items-center gap-2 bg-slate-800/90 p-2 rounded-lg border border-slate-600 backdrop-blur-sm shadow-xl">
+                  <button onClick={() => setZoomLevel(z => Math.min(z * 1.2, 5))} className="p-1.5 hover:bg-slate-700 rounded text-slate-300"><ZoomIn className="w-4 h-4" /></button>
+                  <span className="text-xs text-slate-400 font-mono w-10 text-center">{Math.round(zoomLevel * 100)}%</span>
+                  <button onClick={() => setZoomLevel(z => Math.max(z / 1.2, 0.2))} className="p-1.5 hover:bg-slate-700 rounded text-slate-300"><ZoomOut className="w-4 h-4" /></button>
+                  <div className="w-px h-4 bg-slate-600 mx-1"></div>
+                  <button
+                    onClick={() => { setZoomLevel(1); setRot3D({ x: 0.5, y: 0.5 }); setPan3D({ x: 0, y: 0 }); }}
+                    className="p-1.5 hover:bg-slate-700 rounded text-slate-300"
+                    title="Reset View"
+                  >
+                    <RefreshCw className="w-4 h-4" />
+                  </button>
                 </div>
-                <div>
-                  <span className="font-bold text-slate-100">lag（遅れ）</span>：
-                  どちらが先行・遅延しているかの指標（クロス相関で最大となる時間差）。
-                  狭窄や流れの乱れがあると、波形のタイミングズレとして現れることがあります。
-                </div>
-                <div>
-                  <span className="font-bold text-slate-100">sim（同時ピーク数）</span>：
-                  WSSのピークが、PressureProxyのピークと同時（±1サンプル以内）に出現した回数。
-                  同時ピークが多いほど「連動性が明確」な傾向とみなします。
-                </div>
-                <div className="text-slate-400 pt-2 border-t border-slate-700">
-                  ※PressureProxy は現状「血流領域の面積（Area）」を代理指標として使用しています（運用に合わせて差し替え可能）。
+
+                <div className="flex items-center gap-3 bg-slate-800/90 px-4 py-2 rounded-lg border border-slate-600 backdrop-blur-sm shadow-xl">
+                  <span className="text-xs font-bold text-slate-300">Filter</span>
+                  <input
+                    type="range" min="0" max="3" step="1"
+                    value={noiseFilterLevel}
+                    onChange={(e) => setNoiseFilterLevel(Number(e.target.value))}
+                    className="w-20 h-1.5 bg-slate-600 rounded-lg appearance-none cursor-pointer accent-blue-500"
+                  />
+                  <span className="text-xs font-mono text-blue-300 w-8 text-center">{['Off', 'Low', 'Med', 'Hi'][noiseFilterLevel]}</span>
                 </div>
               </div>
             </div>
+          </div>
+        )}
 
-            <div className="mt-4 flex justify-end">
-              <button onClick={() => setShowParamExplain(false)} className="px-4 py-2 bg-slate-700 hover:bg-slate-600 rounded text-white text-sm">
-                閉じる
-              </button>
+        {modalData && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
+            <div className="bg-slate-800 rounded-xl border border-slate-700 p-1 max-w-4xl w-full">
+              <div className="flex justify-between items-center p-3 border-b border-slate-700 mb-2">
+                <span className="font-bold">{modalData.title}</span>
+                <button onClick={() => setModalData(null)}><X className="w-5 h-5" /></button>
+              </div>
+              <div className="aspect-video bg-black flex justify-center">
+                <canvas ref={modalCanvasRef} className="h-full object-contain" />
+              </div>
             </div>
           </div>
-        </div>
-      )}
+        )}
+
+        {isParamInfoOpen && stenosisResult && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
+            <div className="bg-slate-800 rounded-xl border border-slate-700 p-5 max-w-2xl w-full">
+              <div className="flex items-center justify-between mb-3">
+                <div className="font-bold text-slate-100">パラメータ数値の説明</div>
+                <button onClick={() => setIsParamInfoOpen(false)} className="p-1 hover:bg-slate-700 rounded">
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+              <div className="text-sm text-slate-200 space-y-2">
+                <div className="bg-slate-900/40 border border-slate-700 rounded-lg p-3">
+                  <div className="font-bold">現状の数値</div>
+                  <div className="text-xs text-slate-300 mt-1">
+                    corr={Number.isFinite(stenosisResult.corr) ? stenosisResult.corr.toFixed(2) : 'NaN'} / lag={Number.isFinite(stenosisResult.lagSec) ? stenosisResult.lagSec.toFixed(2) : 'NaN'}s / sim={stenosisResult.simultaneousPeakCounts ?? 0}
+                  </div>
+                </div>
+
+                <div className="text-xs text-slate-300">
+                  <div className="font-bold text-slate-200">corr</div>
+                  <div>WSSとPressureProxy(area)の相関。|corr|が大きいほど「同じ動きをする」傾向。</div>
+                </div>
+
+                <div className="text-xs text-slate-300">
+                  <div className="font-bold text-slate-200">lag</div>
+                  <div>Cross-correlationで推定したタイミング差。正なら「WSSが遅れて出る」傾向。</div>
+                </div>
+
+                <div className="text-xs text-slate-300">
+                  <div className="font-bold text-slate-200">sim</div>
+                  <div>局所ピークが±1点以内で一致した回数。多いほど連動が明確。</div>
+                </div>
+
+                <div className="text-xs text-slate-400 border-t border-slate-700 pt-3">
+                  ※PDF出力では、説明文をレポート末尾にまとめて記載します。
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {isPdfConfirmOpen && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4 animate-in fade-in">
+            <div className="bg-slate-800 rounded-xl border border-slate-700 p-5 max-w-md w-full">
+              <div className="flex items-center justify-between mb-3">
+                <div className="font-bold text-slate-100 flex items-center gap-2">
+                  <FileDown className="w-5 h-5" /> PDF出力
+                </div>
+                <button onClick={handlePdfConfirmNo} className="p-1 hover:bg-slate-700 rounded">
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+              <div className="text-sm text-slate-200">
+                現状の結果をPDF出力しますか？
+              </div>
+              <div className="flex justify-end gap-2 mt-4">
+                <button
+                  onClick={handlePdfConfirmNo}
+                  className="px-4 py-2 rounded bg-slate-700 hover:bg-slate-600 text-white text-sm"
+                >
+                  No
+                </button>
+                <button
+                  onClick={handlePdfConfirmYes}
+                  className="px-4 py-2 rounded bg-blue-600 hover:bg-blue-500 text-white text-sm font-bold disabled:opacity-50"
+                  disabled={isPdfExporting}
+                >
+                  {isPdfExporting ? '生成中...' : 'Yes'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   );
 };
