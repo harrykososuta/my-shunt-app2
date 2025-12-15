@@ -1,181 +1,20 @@
 // src/App.jsx
 // ShuntFlow Analytics - v1.0.7
-// ✅ Add stenosis classification (corr / lag / simultaneous peaks / 4-tier + score correction)
-// ✅ Improve "Pressure proxy" to use mean RED intensity in ROI (instead of area-only)
-// ✅ Better dt estimation using video duration + total frames (no assumed FPS)
-// ✅ Keep stability fixes (cleanup RAF/interval + mounted guard)
+// Changes:
+// 1) Move graphComment overlay -> BELOW chart
+// 2) Add stenosis logic (corr/lag/simultaneous peaks) + classification
+// 3) Add "parameter explanation" button -> popup modal
+// 4) Add alert pickup section (TAWSS/OSI/RRT/PressureProxy)
+// 5) Add "most dangerous frames (top ~3)" captured during analysis -> shown only when Check pressed
+// 6) Keep prior crash fixes (RAF/interval cleanup + mounted guards)
 
-import React, { useState, useRef, useEffect, useLayoutEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo } from 'react';
 import {
   Upload, Play, Pause, RotateCcw, Activity, AlertCircle, FileVideo, Crosshair,
   Download, Settings, Ruler, Scan, Eye, Zap, Move3d, MousePointer2, TrendingUp,
-  Maximize2, X, Sliders, Eraser, Undo, ZoomIn, ZoomOut, RefreshCw, Move, Camera
+  Maximize2, X, Sliders, Eraser, Undo, ZoomIn, ZoomOut, RefreshCw, Move, Camera, Info
 } from 'lucide-react';
 import { ComposedChart, Line, Area, XAxis, YAxis, CartesianGrid, Tooltip, Legend } from 'recharts';
-
-/* =========================
-   Stenosis Logic (JS port)
-   ========================= */
-
-const detectLocalPeaks = (arr) => {
-  const peaks = [];
-  for (let i = 1; i < arr.length - 1; i++) {
-    const v = arr[i];
-    if (Number.isFinite(v) && v >= arr[i - 1] && v >= arr[i + 1]) peaks.push(i);
-  }
-  return peaks;
-};
-
-const corrcoef = (a, b) => {
-  const n = Math.min(a.length, b.length);
-  if (n < 3) return NaN;
-  const ma = a.slice(0, n).reduce((s, v) => s + v, 0) / n;
-  const mb = b.slice(0, n).reduce((s, v) => s + v, 0) / n;
-  let num = 0, da = 0, db = 0;
-  for (let i = 0; i < n; i++) {
-    const xa = a[i] - ma;
-    const xb = b[i] - mb;
-    num += xa * xb;
-    da += xa * xa;
-    db += xb * xb;
-  }
-  const den = Math.sqrt(da * db);
-  return den > 0 ? num / den : NaN;
-};
-
-// full cross-correlation (O(n^2)) but n<=200 -> OK
-// returns lag index (positive means WSS lags behind pressure if we compute cc(p,w) and maximize)
-const bestLagByCrossCorrelation = (a, b) => {
-  const n = Math.min(a.length, b.length);
-  if (n < 3) return 0;
-
-  const ma = a.slice(0, n).reduce((s, v) => s + v, 0) / n;
-  const mb = b.slice(0, n).reduce((s, v) => s + v, 0) / n;
-  const aa = a.slice(0, n).map(v => v - ma);
-  const bb = b.slice(0, n).map(v => v - mb);
-
-  let best = -Infinity;
-  let bestLag = 0;
-
-  for (let lag = -(n - 1); lag <= (n - 1); lag++) {
-    let s = 0;
-    for (let i = 0; i < n; i++) {
-      const j = i + lag;
-      if (j >= 0 && j < n) s += aa[i] * bb[j];
-    }
-    if (s > best) {
-      best = s;
-      bestLag = lag;
-    }
-  }
-  return bestLag;
-};
-
-const computeFeatureFromTrends = ({ pressure, meanWss, dtSec }) => {
-  const p = [];
-  const w = [];
-  const n0 = Math.min(pressure.length, meanWss.length);
-
-  for (let i = 0; i < n0; i++) {
-    const pv = pressure[i];
-    const wv = meanWss[i];
-    if (Number.isFinite(pv) && Number.isFinite(wv)) {
-      p.push(pv);
-      w.push(wv);
-    }
-  }
-
-  if (p.length < 3) {
-    return {
-      corr_pressure_wss: NaN,
-      lag_sec_wss_after_pressure: NaN,
-      simultaneous_peak_counts: 0
-    };
-  }
-
-  const corr = corrcoef(p, w);
-  const lagIdx = bestLagByCrossCorrelation(p, w);
-  const lagSec = lagIdx * (Number.isFinite(dtSec) ? dtSec : 0);
-
-  const peaksW = detectLocalPeaks(w);
-  const peaksP = detectLocalPeaks(p);
-  const sim = peaksW.reduce((cnt, pw) => (
-    cnt + (peaksP.some(pp => Math.abs(pw - pp) <= 1) ? 1 : 0)
-  ), 0);
-
-  return {
-    corr_pressure_wss: corr,
-    lag_sec_wss_after_pressure: lagSec,
-    simultaneous_peak_counts: sim
-  };
-};
-
-const classifyStenosis = (feat, refStats = null) => {
-  const sim = feat?.simultaneous_peak_counts ?? 0;
-  const lag = feat?.lag_sec_wss_after_pressure ?? 0;
-  const corr = feat?.corr_pressure_wss ?? 0;
-
-  const corrScore = Math.abs(corr);
-  const lagScore = Math.abs(lag);
-
-  let mildScore = null;
-  if (refStats) {
-    const z = (x, m, s) => (s && s > 0 ? (x - m) / s : 0.0);
-    const zSim = z(sim, refStats.sim_peak_mean, refStats.sim_peak_std);
-    const zLag = z(lag, refStats.lag_mean, refStats.lag_std);
-    // corr abs normalized around 0.3 (width 0.2)
-    const zCorr = (corrScore - 0.3) / 0.2;
-    mildScore = zSim + zLag + zCorr * 0.5;
-  }
-
-  let category = "狭窄なし";
-  let rule = "";
-
-  // mild->moderate triggers
-  if (sim >= 50 || lagScore >= 0.8 || corrScore >= 0.3) {
-    if (sim >= 70 || lagScore >= 1.5) {
-      category = "中等度狭窄疑い";
-      rule = `sim高め(${sim}) or lag大(${lag.toFixed(2)}) → 中等度疑い`;
-    } else {
-      category = "軽度狭窄疑い";
-      rule = `sim=${sim}, lag=${lag.toFixed(2)}, corr=${Number.isFinite(corr) ? corr.toFixed(2) : 'NaN'} で軽度疑い`;
-    }
-  }
-
-  // severe triggers
-  if ((sim >= 80 && lagScore >= 2.0) || corrScore >= 0.75) {
-    category = "高度狭窄疑い";
-    rule = `強い異常性: sim=${sim}, lag=${lag.toFixed(2)}, corr=${Number.isFinite(corr) ? corr.toFixed(2) : 'NaN'} → 高度疑い`;
-  }
-
-  // score correction
-  if (mildScore !== null) {
-    if (category === "狭窄なし" && mildScore > 1.0) {
-      category = "軽度狭窄疑い（スコア補正）";
-      rule += `; mild_score=${mildScore.toFixed(2)} 補正`;
-    } else if (category.startsWith("軽度狭窄") && mildScore > 2.0) {
-      category = "中等度狭窄疑い（スコア補正）";
-      rule += `; mild_score=${mildScore.toFixed(2)} 補正`;
-    }
-  }
-
-  if (!rule) {
-    rule = `sim=${sim}, lag=${lag.toFixed(2)}, corr=${Number.isFinite(corr) ? corr.toFixed(2) : 'NaN'} で初期分類`;
-  }
-
-  return { category, rule_used: rule, mild_suspicion_score: mildScore };
-};
-
-// sample reference stats (you can later replace with your dataset)
-const STENOSIS_REF_STATS = {
-  sim_peak_mean: 50.0,
-  sim_peak_std: 15.0,
-  lag_mean: 1.5,
-  lag_std: 1.0,
-};
-
-// timeSeries sampling stride (frames)
-const TS_STRIDE = 6;
 
 const ShuntWSSAnalyzer = () => {
   const [videoSrc, setVideoSrc] = useState(null);
@@ -226,8 +65,14 @@ const ShuntWSSAnalyzer = () => {
   const [modalData, setModalData] = useState(null);
   const [graphMode, setGraphMode] = useState('tawss_osi');
 
-  // ✅ stenosis classification result
+  // --- 新規：狭窄判定 ---
   const [stenosisResult, setStenosisResult] = useState(null);
+  const [showParamExplain, setShowParamExplain] = useState(false);
+
+  // --- 新規：アラート/危険フレーム ---
+  const [alertPickups, setAlertPickups] = useState([]);
+  const [dangerFrames, setDangerFrames] = useState([]); // [{frame, timeSec, score, img}]
+  const dangerFramesRef = useRef([]); // in-flight top3 during analysis
 
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
@@ -266,11 +111,9 @@ const ShuntWSSAnalyzer = () => {
       setGraphW(w > 10 ? w : 0);
     };
 
-    // ✅ 重要：最初に必ず測る（ResizeObserver待ちで0のままにならない）
     measure();
 
     const ro = new ResizeObserver(() => {
-      // 解析中はリサイズイベントを無視して再レンダリングを防ぐ
       if (isPlaying) return;
       measure();
     });
@@ -337,12 +180,10 @@ const ShuntWSSAnalyzer = () => {
     }
 
     uiTimerRef.current = setInterval(() => {
-      // mountedガード
       if (!mountedRef.current) return;
 
       setCurrentFrameCount(frameCountRef.current);
       setRealtimeMetrics({ ...metricsRef.current });
-      // 解析中はグラフ更新をしない。完了時に一括更新する。
     }, 250);
 
     return () => {
@@ -352,6 +193,205 @@ const ShuntWSSAnalyzer = () => {
       }
     };
   }, [isPlaying]);
+
+  // ---------------------------
+  // Utilities (JS版：狭窄ロジック)
+  // ---------------------------
+  const mean = (arr) => {
+    const v = arr.filter((x) => Number.isFinite(x));
+    if (!v.length) return 0;
+    return v.reduce((a, b) => a + b, 0) / v.length;
+  };
+
+  const std = (arr) => {
+    const v = arr.filter((x) => Number.isFinite(x));
+    if (v.length < 2) return 0;
+    const m = mean(v);
+    const s2 = v.reduce((acc, x) => acc + (x - m) * (x - m), 0) / (v.length - 1);
+    return Math.sqrt(s2);
+  };
+
+  const pearsonCorr = (a, b) => {
+    const n = Math.min(a.length, b.length);
+    const xa = [];
+    const xb = [];
+    for (let i = 0; i < n; i++) {
+      if (Number.isFinite(a[i]) && Number.isFinite(b[i])) {
+        xa.push(a[i]);
+        xb.push(b[i]);
+      }
+    }
+    if (xa.length < 3) return 0;
+    const ma = mean(xa);
+    const mb = mean(xb);
+    let num = 0;
+    let da = 0;
+    let db = 0;
+    for (let i = 0; i < xa.length; i++) {
+      const va = xa[i] - ma;
+      const vb = xb[i] - mb;
+      num += va * vb;
+      da += va * va;
+      db += vb * vb;
+    }
+    const den = Math.sqrt(da * db);
+    return den > 1e-9 ? num / den : 0;
+  };
+
+  // naive cross-correlation lag (full) -> returns lagIndex where b is "after" a if positive
+  const crossCorrelationLagIndex = (a, b) => {
+    const n = Math.min(a.length, b.length);
+    const xa = a.slice(0, n).map((x) => (Number.isFinite(x) ? x : 0));
+    const xb = b.slice(0, n).map((x) => (Number.isFinite(x) ? x : 0));
+    const ma = mean(xa);
+    const mb = mean(xb);
+    const aa = xa.map((x) => x - ma);
+    const bb = xb.map((x) => x - mb);
+
+    // lags from -(n-1) ... +(n-1)
+    let bestLag = 0;
+    let bestVal = -Infinity;
+
+    for (let lag = -(n - 1); lag <= (n - 1); lag++) {
+      let sum = 0;
+      for (let i = 0; i < n; i++) {
+        const j = i + lag;
+        if (j < 0 || j >= n) continue;
+        sum += aa[i] * bb[j];
+      }
+      if (sum > bestVal) {
+        bestVal = sum;
+        bestLag = lag;
+      }
+    }
+    return bestLag;
+  };
+
+  const detectLocalPeaksIdx = (arr) => {
+    const peaks = [];
+    for (let i = 1; i < arr.length - 1; i++) {
+      const x = arr[i];
+      if (!Number.isFinite(x)) continue;
+      const p = arr[i - 1];
+      const n = arr[i + 1];
+      if (Number.isFinite(p) && Number.isFinite(n) && x >= p && x >= n) peaks.push(i);
+    }
+    return peaks;
+  };
+
+  const computeTrendFeatures = (pressureProxyArr, wssArr, timeArr) => {
+    // align by finite values (simple mask)
+    const p = [];
+    const w = [];
+    const t = [];
+    const n = Math.min(pressureProxyArr.length, wssArr.length, timeArr.length);
+    for (let i = 0; i < n; i++) {
+      const pv = pressureProxyArr[i];
+      const wv = wssArr[i];
+      const tv = timeArr[i];
+      if (Number.isFinite(pv) && Number.isFinite(wv) && Number.isFinite(tv)) {
+        p.push(pv);
+        w.push(wv);
+        t.push(tv);
+      }
+    }
+    if (p.length < 3) {
+      return { corr: 0, lagSec: 0, simPeaks: 0 };
+    }
+    const corr = pearsonCorr(p, w);
+    let dt = 0;
+    if (t.length >= 2) {
+      const diffs = [];
+      for (let i = 1; i < t.length; i++) {
+        const d = t[i] - t[i - 1];
+        if (Number.isFinite(d) && d > 0) diffs.push(d);
+      }
+      diffs.sort((a, b) => a - b);
+      dt = diffs.length ? diffs[Math.floor(diffs.length / 2)] : 0;
+    }
+    if (!dt || dt <= 0) dt = 0.2; // fallback (sampling interval guess)
+
+    const lagIdx = crossCorrelationLagIndex(p, w);
+    const lagSec = lagIdx * dt;
+
+    const peaksW = detectLocalPeaksIdx(w);
+    const peaksP = detectLocalPeaksIdx(p);
+    const simPeaks = peaksW.reduce((acc, pw) => {
+      const hit = peaksP.some((pp) => Math.abs(pp - pw) <= 1);
+      return acc + (hit ? 1 : 0);
+    }, 0);
+
+    return { corr, lagSec, simPeaks };
+  };
+
+  const classifyStenosisJS = (feat, refStats = null) => {
+    const sim = feat.simPeaks ?? 0;
+    const lag = feat.lagSec ?? 0;
+    const corr = feat.corr ?? 0;
+
+    const corrScore = Math.abs(corr);
+    const lagScore = Math.abs(lag);
+
+    let mildScore = null;
+    if (refStats) {
+      const z = (x, m, s) => (s && s > 0 ? (x - m) / s : 0);
+      const zSim = z(sim, refStats.sim_peak_mean, refStats.sim_peak_std);
+      const zLag = z(lag, refStats.lag_mean, refStats.lag_std);
+      const zCorr = (corrScore - 0.3) / 0.2;
+      mildScore = zSim + zLag + zCorr * 0.5;
+    }
+
+    let category = "狭窄なし";
+    let rule = "";
+
+    if (sim >= 50 || lagScore >= 0.8 || corrScore >= 0.3) {
+      if (sim >= 70 || lagScore >= 1.5) {
+        category = "中等度狭窄疑い";
+        rule = `sim高め(${sim}) or lag大(${lag.toFixed(2)}s) → 中等度疑い`;
+      } else {
+        category = "軽度狭窄疑い";
+        rule = `sim=${sim}, lag=${lag.toFixed(2)}s, corr=${corr.toFixed(2)} で軽度疑い`;
+      }
+    }
+    if ((sim >= 80 && lagScore >= 2.0) || corrScore >= 0.75) {
+      category = "高度狭窄疑い";
+      rule = `強い異常性: sim=${sim}, lag=${lag.toFixed(2)}s, corr=${corr.toFixed(2)} → 高度疑い`;
+    }
+
+    if (mildScore !== null) {
+      if (category === "狭窄なし" && mildScore > 1.0) {
+        category = "軽度狭窄疑い（スコア補正）";
+        rule += `; mild_score=${mildScore.toFixed(2)} 補正`;
+      } else if (category.startsWith("軽度狭窄") && mildScore > 2.0) {
+        category = "中等度狭窄疑い（スコア補正）";
+        rule += `; mild_score=${mildScore.toFixed(2)} 補正`;
+      }
+    }
+
+    if (!rule) rule = `sim=${sim}, lag=${lag.toFixed(2)}s, corr=${corr.toFixed(2)} で初期分類`;
+
+    return {
+      category,
+      ruleUsed: rule,
+      mildSuspicionScore: mildScore
+    };
+  };
+
+  const refStats = useMemo(() => ({
+    sim_peak_mean: 50.0,
+    sim_peak_std: 15.0,
+    lag_mean: 1.5,
+    lag_std: 1.0,
+  }), []);
+
+  const stenosisIcon = (cat) => {
+    if (!cat) return "⚪️";
+    if (cat.startsWith("高度")) return "🔴";
+    if (cat.startsWith("中等度")) return "🟠";
+    if (cat.startsWith("軽度")) return "🟡";
+    if (cat.startsWith("狭窄なし")) return "🟢";
+    return "⚪️";
+  };
 
   const resetAnalysis = () => {
     safeCancelRAF();
@@ -379,7 +419,13 @@ const ShuntWSSAnalyzer = () => {
     setRot3D({ x: 0.5, y: 0.5 });
     setPan3D({ x: 0, y: 0 });
     setInteractionMode('rotate');
+
+    // new
     setStenosisResult(null);
+    setShowParamExplain(false);
+    setAlertPickups([]);
+    setDangerFrames([]);
+    dangerFramesRef.current = [];
 
     frameCountRef.current = 0;
     metricsRef.current = { avg: 0, max: 0, area: 0, evaluation: '-' };
@@ -798,6 +844,23 @@ const ShuntWSSAnalyzer = () => {
     drawStack(prev, stackCanvasLargeRef.current, true);
   };
 
+  const updateTopDangerFrames = (candidate) => {
+    // candidate: {frame, timeSec, score, img}
+    const cur = dangerFramesRef.current ? [...dangerFramesRef.current] : [];
+    cur.push(candidate);
+    cur.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+    // dedupe by frame
+    const dedup = [];
+    const seen = new Set();
+    for (const c of cur) {
+      if (seen.has(c.frame)) continue;
+      seen.add(c.frame);
+      dedup.push(c);
+      if (dedup.length >= 3) break;
+    }
+    dangerFramesRef.current = dedup;
+  };
+
   const processFrame = useCallback(() => {
     const video = videoRef.current;
     const canvas = canvasRef.current;
@@ -890,34 +953,22 @@ const ShuntWSSAnalyzer = () => {
 
     let flowSumX = 0, flowSumY = 0, flowCount = 0;
 
-    // ✅ pressure proxy (red intensity) inside ROI
-    let redSum = 0;
-    let redCount = 0;
-
     const overlayData = ctx.createImageData(w, h);
     const output = overlayData.data;
 
     for (let y = startY + 1; y < endY - 1; y++) {
       for (let x = startX + 1; x < endX - 1; x++) {
         const i = getIndex(x, y);
-        const r = data[i], g = data[i + 1], b = data[i + 2];
-        const flow = getFlowVector(r, g, b);
+        const flow = getFlowVector(data[i], data[i + 1], data[i + 2]);
 
         if (flow.dir !== 0) {
           flowSumX += x; flowSumY += y; flowCount++;
-
-          // count red only for pressure proxy (closer to your Python approach)
-          if (flow.dir === 1) {
-            redSum += flow.val;
-            redCount += 1;
-          }
         } else {
           let maxVel = 0, maxDir = 0;
           const neighbors = [getIndex(x + 1, y), getIndex(x - 1, y), getIndex(x, y + 1), getIndex(x, y - 1)];
 
           for (let ni of neighbors) {
-            const nr = data[ni], ng = data[ni + 1], nb = data[ni + 2];
-            const nf = getFlowVector(nr, ng, nb);
+            const nf = getFlowVector(data[ni], data[ni + 1], data[ni + 2]);
             if (nf.val > maxVel) { maxVel = nf.val; maxDir = nf.dir; }
           }
 
@@ -987,9 +1038,9 @@ const ShuntWSSAnalyzer = () => {
     }
 
     const avg = frameStressPixels > 0 ? frameTotalStress / frameStressPixels : 0;
-    const pressureRaw = redCount > 0 ? (redSum / redCount) : 0; // 0..255-ish
 
-    if (frameCountRef.current % TS_STRIDE === 0) {
+    // sampling (timeSeries)
+    if (frameCountRef.current % 6 === 0) {
       const evalLabel = avg > 80 ? 'HIGH' : avg > 40 ? 'WARN' : 'NORM';
       metricsRef.current = {
         avg: Math.round(avg),
@@ -998,17 +1049,117 @@ const ShuntWSSAnalyzer = () => {
         evaluation: evalLabel
       };
 
+      const timeSec = Number.isFinite(video.currentTime) ? video.currentTime : (timeSeriesRef.current.length * 0.2);
+
+      // "pressure proxy": areaVal (same as before, but explicitly stored)
+      const pressureProxy = areaVal;
+
       const next = [...timeSeriesRef.current, {
         frame: frameCountRef.current,
+        timeSec: Number(timeSec.toFixed(3)),
         avgWss: Number(avg.toFixed(1)),
-        area: Number(areaVal.toFixed(3)),
-        pressureRaw: Number(pressureRaw.toFixed(2)),
+        area: Number(areaVal.toFixed(3)),          // used by chart (existing)
+        pressureProxy: Number(pressureProxy.toFixed(3)), // new explicit field
       }];
-      timeSeriesRef.current = next.length > 200 ? next.slice(-200) : next;
+      timeSeriesRef.current = next.length > 260 ? next.slice(-260) : next;
+
+      // update top danger frames (keep ~3)
+      // score: WSS (dominant) + pressureProxy (scaled)  ※簡易スコア
+      const pressureScale = (config.scalePxPerCm > 0) ? 40 : 0.8;
+      const score = (avg * 1.0) + (pressureProxy * pressureScale);
+
+      // capture occasionally to avoid heavy memory usage
+      // capture only if it's potentially high risk
+      const maybeHigh = avg > 55 || (pressureProxy > mean(timeSeriesRef.current.map(d => d.pressureProxy)) + std(timeSeriesRef.current.map(d => d.pressureProxy)));
+      if (maybeHigh) {
+        try {
+          const img = canvas.toDataURL('image/jpeg', 0.72);
+          updateTopDangerFrames({
+            frame: frameCountRef.current,
+            timeSec,
+            score,
+            img
+          });
+        } catch (_) {
+          // ignore capture errors
+        }
+      }
     }
 
     animationRef.current = requestAnimationFrame(processFrame);
   }, [config, drawStack, is3DModalOpen]);
+
+  const buildAlertPickups = (results, ts) => {
+    const pickups = [];
+
+    // 1) High TAWSS
+    const highT = results.filter(r => r.tawss > 80);
+    if (highT.length) {
+      const max = highT.reduce((p, c) => p.tawss > c.tawss ? p : c);
+      pickups.push({
+        type: 'warning',
+        title: 'TAWSS High',
+        desc: `${Math.round(max.angle)}°付近で高ストレス（TAWSS=${max.tawss.toFixed(1)}）`,
+        frameLabel: `F${max.maxFrame || '-'}`,
+      });
+    }
+
+    // 2) High OSI
+    const highO = results.filter(r => r.osi > 0.20);
+    if (highO.length) {
+      const max = highO.reduce((p, c) => p.osi > c.osi ? p : c);
+      pickups.push({
+        type: 'warning',
+        title: 'OSI High',
+        desc: `${Math.round(max.angle)}°付近でOSI高値（OSI=${max.osi.toFixed(3)}）`,
+        frameLabel: '-',
+      });
+    }
+
+    // 3) High RRT
+    const highR = results.filter(r => r.rrt > 0.5);
+    if (highR.length) {
+      const max = highR.reduce((p, c) => p.rrt > c.rrt ? p : c);
+      pickups.push({
+        type: 'danger',
+        title: 'RRT High',
+        desc: `${Math.round(max.angle)}°付近で滞留リスク（RRT=${max.rrt.toFixed(3)}）`,
+        frameLabel: '-',
+      });
+    }
+
+    // 4) Pressure proxy (area) anomaly / low compliance
+    if (ts.length >= 6) {
+      const p = ts.map(d => d.pressureProxy);
+      const minP = Math.min(...p);
+      const maxP = Math.max(...p);
+      const dist = minP > 0 ? (maxP - minP) / minP : 0;
+
+      const m = mean(p);
+      const s = std(p);
+      const spikes = ts.filter(d => d.pressureProxy > m + 1.5 * s);
+      if (spikes.length) {
+        const last = spikes[spikes.length - 1];
+        pickups.push({
+          type: 'warning',
+          title: 'PressureProxy Spike',
+          desc: `PressureProxy（面積）が上振れ（例: F${last.frame}, P=${last.pressureProxy.toFixed(3)}）`,
+          frameLabel: `F${last.frame}`,
+        });
+      }
+
+      if (dist < 0.1) {
+        pickups.push({
+          type: 'warning',
+          title: 'Low Compliance',
+          desc: `拍動変動が小さく、伸展性低下の可能性（ΔP/P≈${dist.toFixed(2)}）`,
+          frameLabel: '-',
+        });
+      }
+    }
+
+    return pickups.length ? pickups : [{ type: 'success', title: 'Normal', desc: 'アラート所見なし', frameLabel: '-' }];
+  };
 
   const finalizeAnalysis = () => {
     safeCancelRAF();
@@ -1037,64 +1188,34 @@ const ShuntWSSAnalyzer = () => {
 
     setCurrentFrameCount(frameCountRef.current);
     setRealtimeMetrics({ ...metricsRef.current });
-    // ✅ 完了時に一括更新のみ
     setTimeSeriesData([...timeSeriesRef.current]);
+
+    // freeze danger frames captured
+    setDangerFrames([...dangerFramesRef.current]);
 
     drawBullseye(results);
 
-    // ---- classic diagnostics ----
+    // generate comments + existing diagnostics (kept) + new stenosis logic + new pickups
     generateDiagnostics(results, timeSeriesRef.current);
 
-    // ---- stenosis judgment (recommended integration) ----
     const ts = timeSeriesRef.current;
-    const v = videoRef.current;
-
-    if (ts && ts.length >= 3 && v && Number.isFinite(v.duration) && v.duration > 0 && frameCountRef.current > 0) {
-      // dt per timeseries point:
-      // each ts point taken every TS_STRIDE frames
-      // time per frame ~ duration / totalFrames
-      // dtSec ~ duration * TS_STRIDE / totalFrames
-      const dtSec = (v.duration * TS_STRIDE) / frameCountRef.current;
-
-      const meanWss = ts.map(d => d.avgWss);
-
-      // Normalize pressureRaw by its max (closer to Python normalize-by-M idea)
-      const pRaw = ts.map(d => d.pressureRaw);
-      const pMax = Math.max(...pRaw, 1e-6);
-      const pressure = pRaw.map(x => x / pMax);
-
-      const feat = computeFeatureFromTrends({ pressure, meanWss, dtSec });
-      const cls = classifyStenosis(feat, STENOSIS_REF_STATS);
-      setStenosisResult({ feat, cls, dtSec });
-
-      const icon =
-        cls.category.includes("高度") ? "🔴" :
-        cls.category.includes("中等度") ? "🟠" :
-        cls.category.includes("軽度") ? "🟡" : "🟢";
-
-      const type =
-        cls.category.includes("高度") ? "danger" :
-        cls.category.includes("中等度") ? "warning" :
-        cls.category.includes("軽度") ? "warning" : "success";
-
-      // add a summary card on top
-      setDiagnosticText(prev => ([
-        {
-          type,
-          title: `${icon} 狭窄判定（WSS × PressureProxy）`,
-          desc: `${cls.category} / corr=${Number.isFinite(feat.corr_pressure_wss) ? feat.corr_pressure_wss.toFixed(2) : 'NaN'} / lag=${Number.isFinite(feat.lag_sec_wss_after_pressure) ? feat.lag_sec_wss_after_pressure.toFixed(2) : 'NaN'}s / sim=${feat.simultaneous_peak_counts}`,
-          frameLabel: '-',
-          rawFrame: null
-        },
-        ...prev
-      ]));
+    if (ts.length >= 3) {
+      const wssArr = ts.map(d => d.avgWss);
+      const pArr = ts.map(d => d.pressureProxy);
+      const tArr = ts.map(d => d.timeSec);
+      const feat = computeTrendFeatures(pArr, wssArr, tArr);
+      const cls = classifyStenosisJS(feat, refStats);
+      setStenosisResult({ feat, cls });
+    } else {
+      setStenosisResult(null);
     }
+
+    setAlertPickups(buildAlertPickups(results, timeSeriesRef.current));
   };
 
   const togglePlay = () => {
     if (!videoRef.current) return;
 
-    // ✅ 開始/停止のたびに必ず掃除（古いRAFやintervalが残るとDOM崩れの原因になりやすい）
     safeCancelRAF();
     if (uiTimerRef.current) {
       clearInterval(uiTimerRef.current);
@@ -1117,7 +1238,6 @@ const ShuntWSSAnalyzer = () => {
 
     videoRef.current.play()
       .then(() => {
-        // mountedガード（StrictModeなどで一瞬unmount→thenが返ってきてもsetStateしない）
         if (!mountedRef.current) return;
         animationRef.current = requestAnimationFrame(processFrame);
       })
@@ -1257,7 +1377,7 @@ const ShuntWSSAnalyzer = () => {
   };
 
   const openFrameModal = (diag) => {
-    if (diag.rawFrame && videoRef.current) {
+    if (diag?.rawFrame && videoRef.current) {
       setModalData(diag);
       const dur = videoRef.current.duration;
       const total = frameCountRef.current;
@@ -1284,6 +1404,32 @@ const ShuntWSSAnalyzer = () => {
     }
   }, [modalData]);
 
+  const openDangerFramesModal = () => {
+    if (!dangerFrames.length) return;
+    setModalData({
+      type: 'dangerFrames',
+      title: '危険フレーム（上位3）',
+      frames: dangerFrames
+    });
+  };
+
+  const stenosisSummaryText = useMemo(() => {
+    if (!stenosisResult?.cls) return "解析後に表示されます";
+    const { category } = stenosisResult.cls;
+    // 例に合わせて「中等度狭窄を示す」形式
+    if (category.startsWith("中等度")) return "中等度狭窄を示す";
+    if (category.startsWith("高度")) return "高度狭窄を示す";
+    if (category.startsWith("軽度")) return "軽度狭窄を示す";
+    if (category.startsWith("狭窄なし")) return "狭窄なしを示す";
+    return category;
+  }, [stenosisResult]);
+
+  const relationshipLine = useMemo(() => {
+    if (!stenosisResult?.feat) return "TAWSS×PressureProxy の関係: 解析待機中";
+    const { corr, lagSec, simPeaks } = stenosisResult.feat;
+    return `TAWSS×PressureProxy の関係: corr=${corr.toFixed(2)} / lag=${lagSec.toFixed(2)}s / sim=${simPeaks}`;
+  }, [stenosisResult]);
+
   return (
     <div className="min-h-screen bg-slate-900 text-slate-100 font-sans p-6">
       <header className="mb-6 flex flex-wrap items-center justify-between border-b border-slate-700 pb-4 gap-4">
@@ -1291,7 +1437,7 @@ const ShuntWSSAnalyzer = () => {
           <Activity className="text-blue-400 w-8 h-8" />
           <div>
             <h1 className="text-2xl font-bold tracking-tight">ShuntFlow <span className="text-blue-400">Pro</span></h1>
-            <p className="text-xs text-slate-500">TAWSS / OSI / Compliance / 3D-Vessel / Stenosis-Logic</p>
+            <p className="text-xs text-slate-500">TAWSS / OSI / Compliance / 3D-Vessel</p>
           </div>
         </div>
         <div className="flex items-center gap-2">
@@ -1375,19 +1521,6 @@ const ShuntWSSAnalyzer = () => {
               value={config.stressMultiplier}
               onChange={(e) => setConfig({ ...config, stressMultiplier: Number(e.target.value) })}
               className="w-full accent-orange-500"
-            />
-          </div>
-          <div>
-            <label className="text-xs text-slate-400 block mb-2">Sectors (Bullseye): {config.sectorCount}</label>
-            <input
-              type="range" min="12" max="72" step="12"
-              value={config.sectorCount}
-              onChange={(e) => {
-                const n = Number(e.target.value);
-                setConfig(p => ({ ...p, sectorCount: n }));
-                accumulationRef.current.sectors = makeSectorAccumulator(n);
-              }}
-              className="w-full accent-slate-400"
             />
           </div>
         </div>
@@ -1490,12 +1623,6 @@ const ShuntWSSAnalyzer = () => {
                   <div className="border-t border-slate-700 pt-1 mt-1">
                     R: 0°, B: 90°, L: 180°, T: 270°
                   </div>
-                  {stenosisResult?.cls && (
-                    <div className="mt-2 border-t border-slate-700 pt-2 text-[10px]">
-                      <div className="text-slate-300 font-bold">Stenosis</div>
-                      <div className="text-slate-400">{stenosisResult.cls.category}</div>
-                    </div>
-                  )}
                 </div>
               </div>
             </div>
@@ -1541,7 +1668,7 @@ const ShuntWSSAnalyzer = () => {
         </div>
 
         <div className="lg:col-span-7 space-y-6">
-          <div className="bg-slate-800 p-6 rounded-xl border border-slate-700 h-[400px] flex flex-col">
+          <div className="bg-slate-800 p-6 rounded-xl border border-slate-700 flex flex-col">
             <div className="flex justify-between items-center mb-4">
               <h3 className="text-slate-400 text-sm font-medium flex items-center gap-2">
                 <Activity className="w-4 h-4" /> Analytic Graphs
@@ -1553,6 +1680,7 @@ const ShuntWSSAnalyzer = () => {
               </div>
             </div>
 
+            {/* 1. TAWSSとOSIの関係の表示（チャート） */}
             <div className="flex-1 min-h-0 min-w-0 relative">
               <div ref={graphBoxRef} className="w-full min-w-0 relative" style={{ height: 280, minHeight: 260 }}>
                 {isPlaying && (
@@ -1579,7 +1707,7 @@ const ShuntWSSAnalyzer = () => {
                           <Tooltip contentStyle={{ backgroundColor: '#1e293b', borderColor: '#334155' }} />
                           <Legend verticalAlign="top" height={36} />
                           <Line yAxisId="left" type="monotone" dataKey="avgWss" stroke="#3b82f6" strokeWidth={2} name="Avg WSS" dot={false} isAnimationActive={false} />
-                          <Area yAxisId="right" type="monotone" dataKey="area" stroke="#10b981" fill="rgba(16,185,129,0.2)" name="Vessel Area (Compliance Proxy)" isAnimationActive={false} />
+                          <Area yAxisId="right" type="monotone" dataKey="area" stroke="#10b981" fill="rgba(16,185,129,0.2)" name="Vessel Area (Pressure Proxy)" isAnimationActive={false} />
                         </ComposedChart>
                       ) : graphMode === 'rrt' ? (
                         <ComposedChart width={graphW} height={280} data={sectorResults}>
@@ -1610,16 +1738,103 @@ const ShuntWSSAnalyzer = () => {
                   )}
                 </div>
               </div>
-
-              {graphComment && !isPlaying && (
-                <div className="absolute bottom-2 left-10 right-10 bg-black/60 text-slate-300 text-xs px-3 py-2 rounded flex items-start gap-2 backdrop-blur-sm border border-slate-700/50">
-                  <TrendingUp className="w-4 h-4 text-blue-400 mt-0.5 flex-shrink-0" />
-                  <span>{graphComment}</span>
-                </div>
-              )}
             </div>
 
-            <div className="grid grid-cols-1 gap-3 mt-4">
+            {/* ここから：指定の順序でチャートの「下」に配置 */}
+            <div className="mt-4 space-y-3">
+
+              {/* 1.（補助）TAWSSとOSIの関係の表示（テキスト） */}
+              <div className="bg-slate-900/60 border border-slate-700 rounded-lg px-4 py-3 text-xs text-slate-300 flex items-start gap-2">
+                <TrendingUp className="w-4 h-4 text-blue-400 mt-0.5 flex-shrink-0" />
+                <div className="space-y-1">
+                  <div className="font-bold text-slate-200">① TAWSS と OSI の関係</div>
+                  <div className="text-slate-300">{relationshipLine}</div>
+                  {graphComment && !isPlaying && (
+                    <div className="text-slate-400">補足: {graphComment}</div>
+                  )}
+                </div>
+              </div>
+
+              {/* 2. 判定comment */}
+              <div className="bg-slate-900/60 border border-slate-700 rounded-lg px-4 py-3 flex items-center justify-between gap-3">
+                <div className="flex items-center gap-3">
+                  <div className="text-2xl">{stenosisIcon(stenosisResult?.cls?.category)}</div>
+                  <div className="flex flex-col">
+                    <div className="text-slate-400 text-[11px] font-bold">② 判定 comment</div>
+                    <div className="text-slate-100 font-bold text-sm">
+                      {stenosisResult?.cls?.category ? stenosisSummaryText : "解析後に表示されます"}
+                    </div>
+                    {stenosisResult?.cls?.category && (
+                      <div className="text-[11px] text-slate-400">
+                        {stenosisResult?.cls?.ruleUsed}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {/* 3. パラメータ数値の説明ボタン（押すとポップアップ） */}
+              <div className="flex items-center justify-between bg-slate-900/60 border border-slate-700 rounded-lg px-4 py-3">
+                <div className="text-xs text-slate-400">
+                  ③ 判定に使用したパラメータ（corr / lag / sim）の説明
+                </div>
+                <button
+                  onClick={() => setShowParamExplain(true)}
+                  disabled={!stenosisResult?.feat}
+                  className="px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-white text-xs disabled:opacity-30 disabled:hover:bg-slate-700 flex items-center gap-2"
+                >
+                  <Info className="w-4 h-4" />
+                  説明を表示
+                </button>
+              </div>
+
+              {/* 4. アラート値ピックアップ */}
+              <div className="bg-slate-900/60 border border-slate-700 rounded-lg px-4 py-3">
+                <div className="text-slate-200 font-bold text-xs mb-2">④ アラート値ピックアップ（TAWSS / OSI / RRT / PressureProxy）</div>
+                <div className="grid grid-cols-1 gap-3">
+                  {alertPickups.map((a, i) => (
+                    <div
+                      key={i}
+                      className={`p-3 rounded border flex items-center gap-3 ${
+                        a.type === 'danger'
+                          ? 'bg-red-900/20 border-red-800'
+                          : a.type === 'warning'
+                            ? 'bg-yellow-900/20 border-yellow-800'
+                            : 'bg-green-900/20 border-green-800'
+                      }`}
+                    >
+                      <AlertCircle className={`w-5 h-5 ${a.type === 'danger' ? 'text-red-500' : a.type === 'warning' ? 'text-yellow-500' : 'text-green-500'}`} />
+                      <div className="flex-1">
+                        <div className="font-bold text-sm text-slate-200">{a.title}</div>
+                        <div className="text-xs text-slate-400">{a.desc}</div>
+                      </div>
+                      <div className="text-[11px] text-slate-400 font-mono">{a.frameLabel}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* 5. 最も危険なframeをピックアップ（3枚）→ Checkで表示 */}
+              <div className="bg-slate-900/60 border border-slate-700 rounded-lg px-4 py-3 flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-slate-200 font-bold text-xs">⑤ 最も危険なフレーム（上位3）</div>
+                  <div className="text-[11px] text-slate-400">
+                    解析中に自動キャプチャした危険度上位フレームを表示します（Checkで展開）。
+                  </div>
+                </div>
+                <button
+                  onClick={openDangerFramesModal}
+                  disabled={!dangerFrames.length}
+                  className="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-white text-xs disabled:opacity-30 disabled:hover:bg-slate-700 flex items-center gap-2"
+                >
+                  <Eye className="w-4 h-4" />
+                  Check
+                </button>
+              </div>
+            </div>
+
+            {/* 既存の診断カード（残す：補助情報として） */}
+            <div className="grid grid-cols-1 gap-3 mt-6">
               {diagnosticText.map((d, i) => (
                 <div
                   key={i}
@@ -1766,7 +1981,8 @@ const ShuntWSSAnalyzer = () => {
         </div>
       )}
 
-      {modalData && (
+      {/* 既存：単一フレームのモーダル */}
+      {modalData && modalData.type !== 'dangerFrames' && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
           <div className="bg-slate-800 rounded-xl border border-slate-700 p-1 max-w-4xl w-full">
             <div className="flex justify-between items-center p-3 border-b border-slate-700 mb-2">
@@ -1775,6 +1991,98 @@ const ShuntWSSAnalyzer = () => {
             </div>
             <div className="aspect-video bg-black flex justify-center">
               <canvas ref={modalCanvasRef} className="h-full object-contain" />
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 新規：危険フレーム（上位3）のモーダル（Checkで開く） */}
+      {modalData && modalData.type === 'dangerFrames' && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
+          <div className="bg-slate-800 rounded-xl border border-slate-700 p-4 max-w-5xl w-full">
+            <div className="flex justify-between items-center pb-3 border-b border-slate-700 mb-4">
+              <span className="font-bold">{modalData.title}</span>
+              <button onClick={() => setModalData(null)} className="p-2 hover:bg-slate-700 rounded"><X className="w-5 h-5" /></button>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              {modalData.frames.map((f, idx) => (
+                <div key={idx} className="bg-slate-900 rounded-lg border border-slate-700 overflow-hidden">
+                  <div className="px-3 py-2 text-xs text-slate-300 flex items-center justify-between border-b border-slate-700">
+                    <span className="font-mono">F{f.frame}</span>
+                    <span className="text-slate-400">{Number(f.timeSec).toFixed(2)}s</span>
+                  </div>
+                  <div className="aspect-video bg-black flex items-center justify-center">
+                    <img src={f.img} alt={`frame-${f.frame}`} className="w-full h-full object-contain" />
+                  </div>
+                  <div className="px-3 py-2 text-[11px] text-slate-400 border-t border-slate-700">
+                    score: {Number(f.score).toFixed(1)}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="mt-4 text-[11px] text-slate-400">
+              ※危険度スコアは「AvgWSS＋PressureProxy（面積）を係数で補正」した簡易指標です。運用に合わせて係数調整できます。
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 新規：パラメータ説明ポップアップ（3のボタン） */}
+      {showParamExplain && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
+          <div className="bg-slate-800 rounded-xl border border-slate-700 p-4 max-w-2xl w-full">
+            <div className="flex justify-between items-center pb-3 border-b border-slate-700 mb-4">
+              <div className="font-bold flex items-center gap-2">
+                <Info className="w-5 h-5 text-blue-400" />
+                判定パラメータの説明
+              </div>
+              <button onClick={() => setShowParamExplain(false)} className="p-2 hover:bg-slate-700 rounded">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="space-y-3 text-sm text-slate-200">
+              <div className="bg-slate-900/60 border border-slate-700 rounded-lg p-3">
+                <div className="text-xs text-slate-400 font-bold mb-1">使用パラメータ（今回の値）</div>
+                <div className="text-xs text-slate-300 font-mono">
+                  {stenosisResult?.feat
+                    ? `corr=${stenosisResult.feat.corr.toFixed(2)} / lag=${stenosisResult.feat.lagSec.toFixed(2)}s / sim=${stenosisResult.feat.simPeaks}`
+                    : "解析待機中"}
+                </div>
+                {stenosisResult?.cls?.mildSuspicionScore !== null && stenosisResult?.cls?.mildSuspicionScore !== undefined && (
+                  <div className="text-xs text-slate-400 mt-1">
+                    mild_score（補正用）: {Number(stenosisResult.cls.mildSuspicionScore).toFixed(2)}
+                  </div>
+                )}
+              </div>
+
+              <div className="space-y-2 text-xs text-slate-300 leading-relaxed">
+                <div>
+                  <span className="font-bold text-slate-100">corr（相関）</span>：
+                  TAWSS と PressureProxy（面積）の「連動の強さ」。±1に近いほど連動が強く、流体力学的に同時変動が目立つ状態を示します。
+                </div>
+                <div>
+                  <span className="font-bold text-slate-100">lag（遅れ）</span>：
+                  どちらが先行・遅延しているかの指標（クロス相関で最大となる時間差）。
+                  狭窄や流れの乱れがあると、波形のタイミングズレとして現れることがあります。
+                </div>
+                <div>
+                  <span className="font-bold text-slate-100">sim（同時ピーク数）</span>：
+                  WSSのピークが、PressureProxyのピークと同時（±1サンプル以内）に出現した回数。
+                  同時ピークが多いほど「連動性が明確」な傾向とみなします。
+                </div>
+                <div className="text-slate-400 pt-2 border-t border-slate-700">
+                  ※PressureProxy は現状「血流領域の面積（Area）」を代理指標として使用しています（運用に合わせて差し替え可能）。
+                </div>
+              </div>
+            </div>
+
+            <div className="mt-4 flex justify-end">
+              <button onClick={() => setShowParamExplain(false)} className="px-4 py-2 bg-slate-700 hover:bg-slate-600 rounded text-white text-sm">
+                閉じる
+              </button>
             </div>
           </div>
         </div>
