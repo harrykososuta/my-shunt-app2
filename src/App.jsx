@@ -4,13 +4,6 @@
 // 1) Hard cleanup on unmount (RAF / interval / video)
 // 2) Start-play always clears previous RAF/interval before play
 // 3) Guard async callbacks with mountedRef
-//
-// v1.0.6+ (3D Vessel Quality Upgrade - keeps existing structure)
-// - Edge-only vessel extraction (cleaner contour)
-// - Grid downsampling (voxel-like thinning)
-// - Temporal persistence filter (reduce flicker / single-frame noise)
-// - Optional angle-sorted line hinting in large 3D view
-// - Reuse offscreen canvas (reduce GC / improve stability)
 
 import React, { useState, useRef, useEffect, useLayoutEffect, useCallback } from 'react';
 import {
@@ -33,12 +26,6 @@ const ShuntWSSAnalyzer = () => {
     roiFlow: null,
     roiVessel: null,
     scalePxPerCm: 0,
-
-    // --- 3D vessel quality (recommended defaults) ---
-    vesselEdgeOnly: true,
-    vesselGridStep: 4,          // px (bigger = thinner / smoother)
-    vesselTemporalWindow: 3,    // slices (1=off)
-    vesselLineHint: true,       // angle-sorted line hint (large view)
   });
 
   // --- UI状態 ---
@@ -84,30 +71,11 @@ const ShuntWSSAnalyzer = () => {
   const animationRef = useRef(null);
   const containerRef = useRef(null);
 
-  // Reuse offscreen canvas for overlay to reduce GC/jank
-  const offscreenOverlayRef = useRef(null);
-
   // refs for heavy updates
   const frameCountRef = useRef(0);
   const metricsRef = useRef({ avg: 0, max: 0, area: 0, evaluation: '-' });
   const timeSeriesRef = useRef([]);
   const uiTimerRef = useRef(null);
-
-  // 3D vessel quality options as ref (avoid re-creating drawStack)
-  const vessel3DRef = useRef({
-    edgeOnly: true,
-    gridStep: 4,
-    temporalWindow: 3,
-    lineHint: true,
-  });
-  useEffect(() => {
-    vessel3DRef.current = {
-      edgeOnly: !!config.vesselEdgeOnly,
-      gridStep: Math.max(2, Math.min(12, Number(config.vesselGridStep || 4))),
-      temporalWindow: Math.max(1, Math.min(6, Number(config.vesselTemporalWindow || 3))),
-      lineHint: !!config.vesselLineHint,
-    };
-  }, [config.vesselEdgeOnly, config.vesselGridStep, config.vesselTemporalWindow, config.vesselLineHint]);
 
   // ✅ mounted guard（StrictModeなどで一瞬unmountされてもsetStateしない）
   const mountedRef = useRef(true);
@@ -541,19 +509,13 @@ const ShuntWSSAnalyzer = () => {
       const zBase = (idx - showFrames.length / 2) * (isLarge ? 3 : 2);
       const alphaBase = 0.2 + (idx / showFrames.length) * 0.8;
 
-      ctx.strokeStyle = `rgba(200, 230, 255, ${alphaBase * 0.45})`;
-      ctx.lineWidth = 0.6;
+      ctx.strokeStyle = `rgba(200, 230, 255, ${alphaBase * 0.5})`;
+      ctx.lineWidth = 0.5;
       ctx.fillStyle = `rgba(220, 240, 255, ${alphaBase})`;
 
       const projectedPoints = [];
-      const lineHint = isLarge && vessel3DRef.current.lineHint;
 
-      // Sort by polar angle to make line hint meaningful
-      const pts = lineHint
-        ? [...slice.vesselPoints].sort((a, b) => Math.atan2(a.y, a.x) - Math.atan2(b.y, b.x))
-        : slice.vesselPoints;
-
-      pts.forEach(p => {
+      slice.vesselPoints.forEach(p => {
         if (!hasNeighbor(p, idx)) return;
 
         const r = rotate(p.x, p.y, zBase, rot3D.x, rot3D.y);
@@ -563,32 +525,18 @@ const ShuntWSSAnalyzer = () => {
 
         projectedPoints.push({ x: px, y: py, z: r.z });
 
-        const size = isLarge ? 1.6 * perspective : 1.2;
+        const size = isLarge ? 1.5 * perspective : 1.2;
         ctx.fillRect(px, py, size, size);
       });
 
-      // Line hint: connect nearby consecutive points (sorted by angle)
-      if (lineHint && projectedPoints.length > 10 && idx % 2 === 0) {
+      if (isLarge && idx > 0 && idx % 2 === 0) {
         ctx.beginPath();
-        for (let i = 1; i < projectedPoints.length; i++) {
-          const a = projectedPoints[i - 1];
-          const b = projectedPoints[i];
-          const dx = a.x - b.x;
-          const dy = a.y - b.y;
-          if (dx * dx + dy * dy < 18 * 18) {
-            ctx.moveTo(a.x, a.y);
-            ctx.lineTo(b.x, b.y);
+        projectedPoints.forEach((p, pIdx) => {
+          if (pIdx > 0 && Math.abs(p.x - projectedPoints[pIdx - 1].x) < 10 && Math.abs(p.y - projectedPoints[pIdx - 1].y) < 10) {
+            ctx.moveTo(p.x, p.y);
+            ctx.lineTo(projectedPoints[pIdx - 1].x, projectedPoints[pIdx - 1].y);
           }
-        }
-        // optional close if ends are near
-        const first = projectedPoints[0];
-        const last = projectedPoints[projectedPoints.length - 1];
-        const dx = first.x - last.x;
-        const dy = first.y - last.y;
-        if (dx * dx + dy * dy < 18 * 18) {
-          ctx.moveTo(last.x, last.y);
-          ctx.lineTo(first.x, first.y);
-        }
+        });
         ctx.stroke();
       }
     });
@@ -700,13 +648,7 @@ const ShuntWSSAnalyzer = () => {
     const w = canvas.width;
     const h = canvas.height;
 
-    try {
-      ctx.drawImage(video, 0, 0, w, h);
-    } catch (_) {
-      // If drawImage fails for a transient reason, try next frame
-      animationRef.current = requestAnimationFrame(processFrame);
-      return;
-    }
+    ctx.drawImage(video, 0, 0, w, h);
 
     if (config.roiFlow) {
       ctx.strokeStyle = 'rgba(239, 68, 68, 0.5)';
@@ -728,9 +670,6 @@ const ShuntWSSAnalyzer = () => {
     let frameStressPixels = 0;
 
     const getIndex = (x, y) => (y * w + x) * 4;
-    const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
-
-    const getBrightness = (i) => (data[i] + data[i + 1] + data[i + 2]) / 3;
 
     const getFlowVector = (r, g, b) => {
       const isRed = r > g + config.colorThreshold && r > b + config.colorThreshold;
@@ -738,103 +677,40 @@ const ShuntWSSAnalyzer = () => {
       return isRed ? { dir: 1, val: r } : isBlue ? { dir: -1, val: b } : { dir: 0, val: 0 };
     };
 
-    // -----------------------
-    // 3D Vessel extraction (cleaner)
-    // -----------------------
     let roiVx = 0, roiVy = 0;
     if (config.roiVessel) {
-      const sx0 = Math.floor(config.roiVessel.x * w);
-      const sy0 = Math.floor(config.roiVessel.y * h);
-      const ex0 = Math.floor((config.roiVessel.x + config.roiVessel.w) * w);
-      const ey0 = Math.floor((config.roiVessel.y + config.roiVessel.h) * h);
+      const sx = Math.floor(config.roiVessel.x * w), sy = Math.floor(config.roiVessel.y * h);
+      const ex = Math.floor((config.roiVessel.x + config.roiVessel.w) * w), ey = Math.floor((config.roiVessel.y + config.roiVessel.h) * h);
+      roiVx = (sx + ex) / 2; roiVy = (sy + ey) / 2;
 
-      const sx = clamp(sx0, 0, w - 1);
-      const sy = clamp(sy0, 0, h - 1);
-      const ex = clamp(ex0, 1, w);
-      const ey = clamp(ey0, 1, h);
-
-      roiVx = (sx + ex) / 2;
-      roiVy = (sy + ey) / 2;
-
-      const { edgeOnly, gridStep } = vessel3DRef.current;
-
-      // sampling step (keep light)
-      const step = 2;
-
-      // Grid thinning (keep one point per grid cell)
-      const grid = new Map();
-      const keyOf = (rx, ry) => `${Math.round(rx / gridStep)}_${Math.round(ry / gridStep)}`;
-
-      // Edge-only detection:
-      // wall = brightness > wallThreshold
-      // edge = wall && (any 4-neighbor is not wall)
-      for (let y = sy + 1; y < ey - 1; y += step) {
-        for (let x = sx + 1; x < ex - 1; x += step) {
+      for (let y = sy; y < ey; y += 2) {
+        for (let x = sx; x < ex; x += 2) {
           const i = getIndex(x, y);
-          const b = getBrightness(i);
-          if (b <= config.wallThreshold) continue;
+          const brightness = (data[i] + data[i + 1] + data[i + 2]) / 3;
 
-          let isEdge = true;
+          if (brightness > config.wallThreshold) {
+            let isInnerWall = false;
+            const checkRange = 3;
 
-          if (edgeOnly) {
-            // 4-neighborhood check
-            const iR = getIndex(x + 1, y);
-            const iL = getIndex(x - 1, y);
-            const iD = getIndex(x, y + 1);
-            const iU = getIndex(x, y - 1);
+            for (let oy = -checkRange; oy <= checkRange; oy += 2) {
+              for (let ox = -checkRange; ox <= checkRange; ox += 2) {
+                if (ox === 0 && oy === 0) continue;
+                const nx = x + ox, ny = y + oy;
+                if (nx < 0 || nx >= w || ny < 0 || ny >= h) continue;
 
-            const br = getBrightness(iR);
-            const bl = getBrightness(iL);
-            const bd = getBrightness(iD);
-            const bu = getBrightness(iU);
+                const ni = getIndex(nx, ny);
+                const nb = (data[ni] + data[ni + 1] + data[ni + 2]) / 3;
+                if (nb < config.wallThreshold * 0.8) { isInnerWall = true; break; }
+              }
+              if (isInnerWall) break;
+            }
 
-            // edge if any neighbor is below threshold
-            isEdge = (br <= config.wallThreshold) || (bl <= config.wallThreshold) || (bd <= config.wallThreshold) || (bu <= config.wallThreshold);
-          }
-
-          if (!isEdge) continue;
-
-          const rx = x - roiVx;
-          const ry = y - roiVy;
-          const k = keyOf(rx, ry);
-          if (!grid.has(k)) {
-            grid.set(k, { x: rx, y: ry });
-          }
-        }
-      }
-
-      vesselPoints = Array.from(grid.values());
-
-      // Temporal persistence filter (remove single-slice speckles)
-      const tw = vessel3DRef.current.temporalWindow;
-      if (tw > 1) {
-        const sb = accumulationRef.current.stackBuffer;
-        const lookback = Math.max(0, tw - 1);
-        if (sb.length >= 1 && lookback > 0) {
-          const prevSlices = sb.slice(-lookback);
-          const prevKeys = new Set();
-          prevSlices.forEach(slc => {
-            slc.vesselPoints.forEach(p => {
-              const k = `${Math.round(p.x / gridStep)}_${Math.round(p.y / gridStep)}`;
-              prevKeys.add(k);
-            });
-          });
-
-          // If we have enough history, keep only persistent points.
-          // (If this becomes too aggressive in the very first slices, it will naturally relax as buffer grows.)
-          if (prevKeys.size > 0) {
-            vesselPoints = vesselPoints.filter(p => {
-              const k = `${Math.round(p.x / gridStep)}_${Math.round(p.y / gridStep)}`;
-              return prevKeys.has(k);
-            });
+            if (isInnerWall) vesselPoints.push({ x: x - roiVx, y: y - roiVy });
           }
         }
       }
     }
 
-    // -----------------------
-    // Flow ROI processing (existing)
-    // -----------------------
     let startX = 0, startY = 0, endX = w, endY = h;
     if (config.roiFlow) {
       startX = Math.floor(config.roiFlow.x * w); startY = Math.floor(config.roiFlow.y * h);
@@ -903,15 +779,8 @@ const ShuntWSSAnalyzer = () => {
       accumulationRef.current.centroid = { x: flowSumX / flowCount, y: flowSumY / flowCount };
     }
 
-    // Reuse offscreen overlay canvas (stability/perf)
-    if (!offscreenOverlayRef.current) {
-      offscreenOverlayRef.current = document.createElement('canvas');
-    }
-    const tempCanvas = offscreenOverlayRef.current;
-    if (tempCanvas.width !== w || tempCanvas.height !== h) {
-      tempCanvas.width = w;
-      tempCanvas.height = h;
-    }
+    const tempCanvas = document.createElement('canvas');
+    tempCanvas.width = w; tempCanvas.height = h;
     const tctx = tempCanvas.getContext('2d');
     if (tctx) {
       tctx.putImageData(overlayData, 0, 0);
@@ -1021,7 +890,6 @@ const ShuntWSSAnalyzer = () => {
       .then(() => {
         // mountedガード（StrictModeなどで一瞬unmount→thenが返ってきてもsetStateしない）
         if (!mountedRef.current) return;
-        if (!videoRef.current) return;
         animationRef.current = requestAnimationFrame(processFrame);
       })
       .catch((e) => {
@@ -1260,7 +1128,6 @@ const ShuntWSSAnalyzer = () => {
               value={config.colorThreshold}
               onChange={(e) => setConfig({ ...config, colorThreshold: Number(e.target.value) })}
               className="w-full accent-blue-500"
-              disabled={isPlaying}
             />
           </div>
           <div>
@@ -1270,7 +1137,6 @@ const ShuntWSSAnalyzer = () => {
               value={config.wallThreshold}
               onChange={(e) => setConfig({ ...config, wallThreshold: Number(e.target.value) })}
               className="w-full accent-emerald-500"
-              disabled={isPlaying}
             />
           </div>
           <div>
@@ -1280,44 +1146,7 @@ const ShuntWSSAnalyzer = () => {
               value={config.stressMultiplier}
               onChange={(e) => setConfig({ ...config, stressMultiplier: Number(e.target.value) })}
               className="w-full accent-orange-500"
-              disabled={isPlaying}
             />
-          </div>
-
-          {/* 3D quality controls (safe defaults, optional tuning) */}
-          <div className="space-y-3">
-            <div className="flex items-center justify-between">
-              <label className="text-xs text-slate-400">3D Edge Only</label>
-              <input
-                type="checkbox"
-                checked={!!config.vesselEdgeOnly}
-                onChange={(e) => setConfig({ ...config, vesselEdgeOnly: e.target.checked })}
-                className="accent-emerald-500"
-                disabled={isPlaying}
-              />
-            </div>
-
-            <div>
-              <label className="text-xs text-slate-400 block mb-1">3D Grid Step: {config.vesselGridStep}px</label>
-              <input
-                type="range" min="2" max="12" step="1"
-                value={config.vesselGridStep}
-                onChange={(e) => setConfig({ ...config, vesselGridStep: Number(e.target.value) })}
-                className="w-full accent-sky-500"
-                disabled={isPlaying}
-              />
-            </div>
-
-            <div>
-              <label className="text-xs text-slate-400 block mb-1">3D Temporal: {config.vesselTemporalWindow}</label>
-              <input
-                type="range" min="1" max="6" step="1"
-                value={config.vesselTemporalWindow}
-                onChange={(e) => setConfig({ ...config, vesselTemporalWindow: Number(e.target.value) })}
-                className="w-full accent-purple-500"
-                disabled={isPlaying}
-              />
-            </div>
           </div>
         </div>
       )}
