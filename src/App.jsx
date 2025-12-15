@@ -1,9 +1,9 @@
 // src/App.jsx
-// ShuntFlow Analytics - v1.0.6
-// Fix crash (insertBefore / NotFoundError) by:
-// 1) Hard cleanup on unmount (RAF / interval / video)
-// 2) Start-play always clears previous RAF/interval before play
-// 3) Guard async callbacks with mountedRef
+// ShuntFlow Analytics - v1.0.7
+// ✅ Add stenosis classification (corr / lag / simultaneous peaks / 4-tier + score correction)
+// ✅ Improve "Pressure proxy" to use mean RED intensity in ROI (instead of area-only)
+// ✅ Better dt estimation using video duration + total frames (no assumed FPS)
+// ✅ Keep stability fixes (cleanup RAF/interval + mounted guard)
 
 import React, { useState, useRef, useEffect, useLayoutEffect, useCallback } from 'react';
 import {
@@ -12,6 +12,170 @@ import {
   Maximize2, X, Sliders, Eraser, Undo, ZoomIn, ZoomOut, RefreshCw, Move, Camera
 } from 'lucide-react';
 import { ComposedChart, Line, Area, XAxis, YAxis, CartesianGrid, Tooltip, Legend } from 'recharts';
+
+/* =========================
+   Stenosis Logic (JS port)
+   ========================= */
+
+const detectLocalPeaks = (arr) => {
+  const peaks = [];
+  for (let i = 1; i < arr.length - 1; i++) {
+    const v = arr[i];
+    if (Number.isFinite(v) && v >= arr[i - 1] && v >= arr[i + 1]) peaks.push(i);
+  }
+  return peaks;
+};
+
+const corrcoef = (a, b) => {
+  const n = Math.min(a.length, b.length);
+  if (n < 3) return NaN;
+  const ma = a.slice(0, n).reduce((s, v) => s + v, 0) / n;
+  const mb = b.slice(0, n).reduce((s, v) => s + v, 0) / n;
+  let num = 0, da = 0, db = 0;
+  for (let i = 0; i < n; i++) {
+    const xa = a[i] - ma;
+    const xb = b[i] - mb;
+    num += xa * xb;
+    da += xa * xa;
+    db += xb * xb;
+  }
+  const den = Math.sqrt(da * db);
+  return den > 0 ? num / den : NaN;
+};
+
+// full cross-correlation (O(n^2)) but n<=200 -> OK
+// returns lag index (positive means WSS lags behind pressure if we compute cc(p,w) and maximize)
+const bestLagByCrossCorrelation = (a, b) => {
+  const n = Math.min(a.length, b.length);
+  if (n < 3) return 0;
+
+  const ma = a.slice(0, n).reduce((s, v) => s + v, 0) / n;
+  const mb = b.slice(0, n).reduce((s, v) => s + v, 0) / n;
+  const aa = a.slice(0, n).map(v => v - ma);
+  const bb = b.slice(0, n).map(v => v - mb);
+
+  let best = -Infinity;
+  let bestLag = 0;
+
+  for (let lag = -(n - 1); lag <= (n - 1); lag++) {
+    let s = 0;
+    for (let i = 0; i < n; i++) {
+      const j = i + lag;
+      if (j >= 0 && j < n) s += aa[i] * bb[j];
+    }
+    if (s > best) {
+      best = s;
+      bestLag = lag;
+    }
+  }
+  return bestLag;
+};
+
+const computeFeatureFromTrends = ({ pressure, meanWss, dtSec }) => {
+  const p = [];
+  const w = [];
+  const n0 = Math.min(pressure.length, meanWss.length);
+
+  for (let i = 0; i < n0; i++) {
+    const pv = pressure[i];
+    const wv = meanWss[i];
+    if (Number.isFinite(pv) && Number.isFinite(wv)) {
+      p.push(pv);
+      w.push(wv);
+    }
+  }
+
+  if (p.length < 3) {
+    return {
+      corr_pressure_wss: NaN,
+      lag_sec_wss_after_pressure: NaN,
+      simultaneous_peak_counts: 0
+    };
+  }
+
+  const corr = corrcoef(p, w);
+  const lagIdx = bestLagByCrossCorrelation(p, w);
+  const lagSec = lagIdx * (Number.isFinite(dtSec) ? dtSec : 0);
+
+  const peaksW = detectLocalPeaks(w);
+  const peaksP = detectLocalPeaks(p);
+  const sim = peaksW.reduce((cnt, pw) => (
+    cnt + (peaksP.some(pp => Math.abs(pw - pp) <= 1) ? 1 : 0)
+  ), 0);
+
+  return {
+    corr_pressure_wss: corr,
+    lag_sec_wss_after_pressure: lagSec,
+    simultaneous_peak_counts: sim
+  };
+};
+
+const classifyStenosis = (feat, refStats = null) => {
+  const sim = feat?.simultaneous_peak_counts ?? 0;
+  const lag = feat?.lag_sec_wss_after_pressure ?? 0;
+  const corr = feat?.corr_pressure_wss ?? 0;
+
+  const corrScore = Math.abs(corr);
+  const lagScore = Math.abs(lag);
+
+  let mildScore = null;
+  if (refStats) {
+    const z = (x, m, s) => (s && s > 0 ? (x - m) / s : 0.0);
+    const zSim = z(sim, refStats.sim_peak_mean, refStats.sim_peak_std);
+    const zLag = z(lag, refStats.lag_mean, refStats.lag_std);
+    // corr abs normalized around 0.3 (width 0.2)
+    const zCorr = (corrScore - 0.3) / 0.2;
+    mildScore = zSim + zLag + zCorr * 0.5;
+  }
+
+  let category = "狭窄なし";
+  let rule = "";
+
+  // mild->moderate triggers
+  if (sim >= 50 || lagScore >= 0.8 || corrScore >= 0.3) {
+    if (sim >= 70 || lagScore >= 1.5) {
+      category = "中等度狭窄疑い";
+      rule = `sim高め(${sim}) or lag大(${lag.toFixed(2)}) → 中等度疑い`;
+    } else {
+      category = "軽度狭窄疑い";
+      rule = `sim=${sim}, lag=${lag.toFixed(2)}, corr=${Number.isFinite(corr) ? corr.toFixed(2) : 'NaN'} で軽度疑い`;
+    }
+  }
+
+  // severe triggers
+  if ((sim >= 80 && lagScore >= 2.0) || corrScore >= 0.75) {
+    category = "高度狭窄疑い";
+    rule = `強い異常性: sim=${sim}, lag=${lag.toFixed(2)}, corr=${Number.isFinite(corr) ? corr.toFixed(2) : 'NaN'} → 高度疑い`;
+  }
+
+  // score correction
+  if (mildScore !== null) {
+    if (category === "狭窄なし" && mildScore > 1.0) {
+      category = "軽度狭窄疑い（スコア補正）";
+      rule += `; mild_score=${mildScore.toFixed(2)} 補正`;
+    } else if (category.startsWith("軽度狭窄") && mildScore > 2.0) {
+      category = "中等度狭窄疑い（スコア補正）";
+      rule += `; mild_score=${mildScore.toFixed(2)} 補正`;
+    }
+  }
+
+  if (!rule) {
+    rule = `sim=${sim}, lag=${lag.toFixed(2)}, corr=${Number.isFinite(corr) ? corr.toFixed(2) : 'NaN'} で初期分類`;
+  }
+
+  return { category, rule_used: rule, mild_suspicion_score: mildScore };
+};
+
+// sample reference stats (you can later replace with your dataset)
+const STENOSIS_REF_STATS = {
+  sim_peak_mean: 50.0,
+  sim_peak_std: 15.0,
+  lag_mean: 1.5,
+  lag_std: 1.0,
+};
+
+// timeSeries sampling stride (frames)
+const TS_STRIDE = 6;
 
 const ShuntWSSAnalyzer = () => {
   const [videoSrc, setVideoSrc] = useState(null);
@@ -61,6 +225,9 @@ const ShuntWSSAnalyzer = () => {
   const [realtimeMetrics, setRealtimeMetrics] = useState({ avg: 0, max: 0, area: 0, evaluation: '-' });
   const [modalData, setModalData] = useState(null);
   const [graphMode, setGraphMode] = useState('tawss_osi');
+
+  // ✅ stenosis classification result
+  const [stenosisResult, setStenosisResult] = useState(null);
 
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
@@ -212,6 +379,7 @@ const ShuntWSSAnalyzer = () => {
     setRot3D({ x: 0.5, y: 0.5 });
     setPan3D({ x: 0, y: 0 });
     setInteractionMode('rotate');
+    setStenosisResult(null);
 
     frameCountRef.current = 0;
     metricsRef.current = { avg: 0, max: 0, area: 0, evaluation: '-' };
@@ -722,22 +890,34 @@ const ShuntWSSAnalyzer = () => {
 
     let flowSumX = 0, flowSumY = 0, flowCount = 0;
 
+    // ✅ pressure proxy (red intensity) inside ROI
+    let redSum = 0;
+    let redCount = 0;
+
     const overlayData = ctx.createImageData(w, h);
     const output = overlayData.data;
 
     for (let y = startY + 1; y < endY - 1; y++) {
       for (let x = startX + 1; x < endX - 1; x++) {
         const i = getIndex(x, y);
-        const flow = getFlowVector(data[i], data[i + 1], data[i + 2]);
+        const r = data[i], g = data[i + 1], b = data[i + 2];
+        const flow = getFlowVector(r, g, b);
 
         if (flow.dir !== 0) {
           flowSumX += x; flowSumY += y; flowCount++;
+
+          // count red only for pressure proxy (closer to your Python approach)
+          if (flow.dir === 1) {
+            redSum += flow.val;
+            redCount += 1;
+          }
         } else {
           let maxVel = 0, maxDir = 0;
           const neighbors = [getIndex(x + 1, y), getIndex(x - 1, y), getIndex(x, y + 1), getIndex(x, y - 1)];
 
           for (let ni of neighbors) {
-            const nf = getFlowVector(data[ni], data[ni + 1], data[ni + 2]);
+            const nr = data[ni], ng = data[ni + 1], nb = data[ni + 2];
+            const nf = getFlowVector(nr, ng, nb);
             if (nf.val > maxVel) { maxVel = nf.val; maxDir = nf.dir; }
           }
 
@@ -807,8 +987,9 @@ const ShuntWSSAnalyzer = () => {
     }
 
     const avg = frameStressPixels > 0 ? frameTotalStress / frameStressPixels : 0;
+    const pressureRaw = redCount > 0 ? (redSum / redCount) : 0; // 0..255-ish
 
-    if (frameCountRef.current % 6 === 0) {
+    if (frameCountRef.current % TS_STRIDE === 0) {
       const evalLabel = avg > 80 ? 'HIGH' : avg > 40 ? 'WARN' : 'NORM';
       metricsRef.current = {
         avg: Math.round(avg),
@@ -821,6 +1002,7 @@ const ShuntWSSAnalyzer = () => {
         frame: frameCountRef.current,
         avgWss: Number(avg.toFixed(1)),
         area: Number(areaVal.toFixed(3)),
+        pressureRaw: Number(pressureRaw.toFixed(2)),
       }];
       timeSeriesRef.current = next.length > 200 ? next.slice(-200) : next;
     }
@@ -859,7 +1041,54 @@ const ShuntWSSAnalyzer = () => {
     setTimeSeriesData([...timeSeriesRef.current]);
 
     drawBullseye(results);
+
+    // ---- classic diagnostics ----
     generateDiagnostics(results, timeSeriesRef.current);
+
+    // ---- stenosis judgment (recommended integration) ----
+    const ts = timeSeriesRef.current;
+    const v = videoRef.current;
+
+    if (ts && ts.length >= 3 && v && Number.isFinite(v.duration) && v.duration > 0 && frameCountRef.current > 0) {
+      // dt per timeseries point:
+      // each ts point taken every TS_STRIDE frames
+      // time per frame ~ duration / totalFrames
+      // dtSec ~ duration * TS_STRIDE / totalFrames
+      const dtSec = (v.duration * TS_STRIDE) / frameCountRef.current;
+
+      const meanWss = ts.map(d => d.avgWss);
+
+      // Normalize pressureRaw by its max (closer to Python normalize-by-M idea)
+      const pRaw = ts.map(d => d.pressureRaw);
+      const pMax = Math.max(...pRaw, 1e-6);
+      const pressure = pRaw.map(x => x / pMax);
+
+      const feat = computeFeatureFromTrends({ pressure, meanWss, dtSec });
+      const cls = classifyStenosis(feat, STENOSIS_REF_STATS);
+      setStenosisResult({ feat, cls, dtSec });
+
+      const icon =
+        cls.category.includes("高度") ? "🔴" :
+        cls.category.includes("中等度") ? "🟠" :
+        cls.category.includes("軽度") ? "🟡" : "🟢";
+
+      const type =
+        cls.category.includes("高度") ? "danger" :
+        cls.category.includes("中等度") ? "warning" :
+        cls.category.includes("軽度") ? "warning" : "success";
+
+      // add a summary card on top
+      setDiagnosticText(prev => ([
+        {
+          type,
+          title: `${icon} 狭窄判定（WSS × PressureProxy）`,
+          desc: `${cls.category} / corr=${Number.isFinite(feat.corr_pressure_wss) ? feat.corr_pressure_wss.toFixed(2) : 'NaN'} / lag=${Number.isFinite(feat.lag_sec_wss_after_pressure) ? feat.lag_sec_wss_after_pressure.toFixed(2) : 'NaN'}s / sim=${feat.simultaneous_peak_counts}`,
+          frameLabel: '-',
+          rawFrame: null
+        },
+        ...prev
+      ]));
+    }
   };
 
   const togglePlay = () => {
@@ -1062,7 +1291,7 @@ const ShuntWSSAnalyzer = () => {
           <Activity className="text-blue-400 w-8 h-8" />
           <div>
             <h1 className="text-2xl font-bold tracking-tight">ShuntFlow <span className="text-blue-400">Pro</span></h1>
-            <p className="text-xs text-slate-500">TAWSS / OSI / Compliance / 3D-Vessel</p>
+            <p className="text-xs text-slate-500">TAWSS / OSI / Compliance / 3D-Vessel / Stenosis-Logic</p>
           </div>
         </div>
         <div className="flex items-center gap-2">
@@ -1146,6 +1375,19 @@ const ShuntWSSAnalyzer = () => {
               value={config.stressMultiplier}
               onChange={(e) => setConfig({ ...config, stressMultiplier: Number(e.target.value) })}
               className="w-full accent-orange-500"
+            />
+          </div>
+          <div>
+            <label className="text-xs text-slate-400 block mb-2">Sectors (Bullseye): {config.sectorCount}</label>
+            <input
+              type="range" min="12" max="72" step="12"
+              value={config.sectorCount}
+              onChange={(e) => {
+                const n = Number(e.target.value);
+                setConfig(p => ({ ...p, sectorCount: n }));
+                accumulationRef.current.sectors = makeSectorAccumulator(n);
+              }}
+              className="w-full accent-slate-400"
             />
           </div>
         </div>
@@ -1248,6 +1490,12 @@ const ShuntWSSAnalyzer = () => {
                   <div className="border-t border-slate-700 pt-1 mt-1">
                     R: 0°, B: 90°, L: 180°, T: 270°
                   </div>
+                  {stenosisResult?.cls && (
+                    <div className="mt-2 border-t border-slate-700 pt-2 text-[10px]">
+                      <div className="text-slate-300 font-bold">Stenosis</div>
+                      <div className="text-slate-400">{stenosisResult.cls.category}</div>
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
@@ -1331,7 +1579,7 @@ const ShuntWSSAnalyzer = () => {
                           <Tooltip contentStyle={{ backgroundColor: '#1e293b', borderColor: '#334155' }} />
                           <Legend verticalAlign="top" height={36} />
                           <Line yAxisId="left" type="monotone" dataKey="avgWss" stroke="#3b82f6" strokeWidth={2} name="Avg WSS" dot={false} isAnimationActive={false} />
-                          <Area yAxisId="right" type="monotone" dataKey="area" stroke="#10b981" fill="rgba(16,185,129,0.2)" name="Vessel Area (Pressure Proxy)" isAnimationActive={false} />
+                          <Area yAxisId="right" type="monotone" dataKey="area" stroke="#10b981" fill="rgba(16,185,129,0.2)" name="Vessel Area (Compliance Proxy)" isAnimationActive={false} />
                         </ComposedChart>
                       ) : graphMode === 'rrt' ? (
                         <ComposedChart width={graphW} height={280} data={sectorResults}>
