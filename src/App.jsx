@@ -1,20 +1,37 @@
 // src/App.jsx
-// ShuntFlow Analytics - v2.0.5 (Fix: PDF Visibility Overlay Issue)
+// ShuntFlow Analytics - v2.2.0 (Integrated Hard Reset)
 //
 // Updates:
-// - Solved the "PDF see-through" issue by restructuring the DOM layers.
-// - The Main UI is now wrapped in a high z-index, opaque container that completely covers the PDF report layout underneath.
-// - Restored the original dark theme aesthetics of the main screen.
+// - Implemented "Hard Reset" pattern using a 'mountKey' on a wrapper component.
+//   This forces a complete unmount/remount cycle to clear all memory/DOM issues.
+// - Fixed "NotFoundError" by ensuring clean destruction of video elements via the key change.
+// - PDF Export now triggers this hard reset upon completion.
+// - Manual Delete button triggers the hard reset.
 
 import React, { useState, useRef, useEffect, useLayoutEffect, useCallback } from 'react';
 import {
   Upload, Play, Pause, RotateCcw, Activity, AlertCircle, FileVideo, Crosshair,
   Download, Settings, Ruler, Scan, Eye, Zap, Move3d, MousePointer2, TrendingUp,
-  Maximize2, X, Sliders, Eraser, Undo, ZoomIn, ZoomOut, RefreshCw, Move, Camera, FileDown, Info
+  Maximize2, X, Sliders, Eraser, Undo, ZoomIn, ZoomOut, RefreshCw, Move, Camera, FileDown, Info, Trash2
 } from 'lucide-react';
 import { ComposedChart, Line, Area, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 
+// --- Main Wrapper for Hard Reset Pattern ---
 const ShuntWSSAnalyzer = () => {
+  // Using a key to force complete re-mounting of the analyzer
+  const [mountKey, setMountKey] = useState(0);
+
+  const handleHardReset = useCallback(() => {
+    // Incrementing key forces React to unmount the old component instance 
+    // and mount a brand new one with fresh state.
+    setMountKey(prev => prev + 1);
+  }, []);
+
+  return <AnalyzerCore key={mountKey} onHardReset={handleHardReset} />;
+};
+
+// --- Core Application Logic (Formerly ShuntWSSAnalyzer) ---
+const AnalyzerCore = ({ onHardReset }) => {
   const [videoSrc, setVideoSrc] = useState(null);
   const [isPlaying, setIsPlaying] = useState(false);
 
@@ -89,7 +106,7 @@ const ShuntWSSAnalyzer = () => {
   const modalCanvasRef = useRef(null);
   const animationRef = useRef(null);
   const containerRef = useRef(null);
-  
+   
   // PDFレポート用の非表示コンテナRef
   const reportContainerRef = useRef(null);
 
@@ -133,6 +150,9 @@ const ShuntWSSAnalyzer = () => {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
+      // Cleanup cleanup
+      if (animationRef.current) cancelAnimationFrame(animationRef.current);
+      if (uiTimerRef.current) clearInterval(uiTimerRef.current);
     };
   }, []);
 
@@ -182,21 +202,6 @@ const ShuntWSSAnalyzer = () => {
       animationRef.current = null;
     }
   };
-
-  useEffect(() => {
-    return () => {
-      safeCancelRAF();
-      if (uiTimerRef.current) {
-        clearInterval(uiTimerRef.current);
-        uiTimerRef.current = null;
-      }
-      if (videoRef.current) {
-        try {
-          videoRef.current.pause();
-        } catch (_) {}
-      }
-    };
-  }, []);
 
   useEffect(() => {
     if (!isPlaying) {
@@ -273,15 +278,20 @@ const ShuntWSSAnalyzer = () => {
     const file = event.target.files?.[0];
     if (file) {
       const url = URL.createObjectURL(file);
+      // Soft reset for new file load within same component instance
+      resetAnalysis();
       setVideoSrc(url);
       setConfig(prev => ({ ...prev, roiFlow: null, roiVessel: null, scalePxPerCm: 0 }));
     }
+    // Clear input value so same file can be selected again
+    event.target.value = '';
   };
 
   const handleVideoLoaded = () => {
-    resetAnalysis();
-    if (videoRef.current && canvasRef.current) {
-      requestAnimationFrame(renderOverlay);
+    // Only reset if we have a source, otherwise it might be a cleanup event
+    if (videoRef.current && videoRef.current.src) {
+        resetAnalysis();
+        requestAnimationFrame(renderOverlay);
     }
   };
 
@@ -296,10 +306,11 @@ const ShuntWSSAnalyzer = () => {
   };
 
   const renderOverlay = useCallback(() => {
+    // Guard against unmounted ref
+    if (!videoRef.current || !canvasRef.current) return;
+
     const video = videoRef.current;
     const canvas = canvasRef.current;
-    if (!video || !canvas) return;
-
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
     if (!ctx) return;
 
@@ -1300,6 +1311,13 @@ const ShuntWSSAnalyzer = () => {
       const fname = `ShuntFlow_Report_${new Date().toISOString().slice(0, 19).replace(/[-:]/g, "")}.pdf`;
       pdf.save(fname);
 
+      // --- AUTO RESET AFTER SUCCESSFUL EXPORT (Wrapped in timeout to prevent React errors) ---
+      // v2.2.0 Pattern: Use Hard Reset to wipe everything cleanly
+      setTimeout(() => {
+        alert("PDF出力が完了しました。全データをリセットします。");
+        onHardReset(); 
+      }, 1000); // 1s delay to ensure PDF save process is disconnected from React updates
+
     } catch (err) {
       console.error("PDF Export failed", err);
       alert("PDF作成に失敗しました: " + err.message);
@@ -1343,7 +1361,7 @@ const ShuntWSSAnalyzer = () => {
           width: '794px', 
           minHeight: '1123px', // A4 height
           backgroundColor: '#ffffff', // Critical: White background
-          color: '#000000',           // Black text for readability
+          color: '#000000',            // Black text for readability
           padding: '40px',
           fontFamily: '"Noto Sans JP", sans-serif',
           zIndex: 0, // Behind the main UI
@@ -1542,6 +1560,16 @@ const ShuntWSSAnalyzer = () => {
               <FileDown className="w-5 h-5" />
             </button>
 
+            {/* Delete / Hard Reset Video button */}
+            {/* Calls onHardReset (passed from wrapper) to wipe everything */}
+            <button
+                onClick={onHardReset}
+                className="flex items-center gap-2 px-3 py-2 bg-slate-800 hover:bg-red-900/30 text-slate-400 hover:text-red-400 rounded-lg border border-slate-700 transition-colors"
+                title="リセット (全データ削除)"
+            >
+                <Trash2 className="w-4 h-4" />
+            </button>
+
             <label className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-lg cursor-pointer text-sm font-medium transition-colors">
               <Upload className="w-4 h-4" /> 動画読込
               <input type="file" accept="video/*" onChange={handleFileUpload} className="hidden" />
@@ -1596,7 +1624,7 @@ const ShuntWSSAnalyzer = () => {
                   <p>動画を選択してください</p>
                 </div>
               ) : (
-                <>
+                <React.Fragment key={videoSrc}>
                   <video
                     ref={videoRef}
                     src={videoSrc}
@@ -1629,7 +1657,7 @@ const ShuntWSSAnalyzer = () => {
                       <Crosshair className="w-3 h-3 text-yellow-400" /> {analysisStatus} F:{currentFrameCount}
                     </div>
                   </div>
-                </>
+                </React.Fragment>
               )}
             </div>
 
@@ -2038,7 +2066,8 @@ const ShuntWSSAnalyzer = () => {
                 </button>
               </div>
               <div className="text-sm text-slate-200">
-                現状の結果をPDF出力しますか？
+                <p>現状の結果をPDF出力しますか？</p>
+                <p className="text-xs text-slate-400 mt-2">※出力後、動画データは自動的に消去され、アプリはリセットされます。</p>
               </div>
               <div className="flex justify-end gap-2 mt-4">
                 <button
